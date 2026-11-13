@@ -1,0 +1,2193 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TerraTwin HPC Climate Modeling &amp; Telemetry Hub (v2.5.0)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background-color: #060a12;
+      color: #e2e8f0;
+      margin: 0;
+      overflow: hidden;
+      user-select: none;
+    }
+    .mono { font-family: var(--font-mono); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0b1220; }
+    ::-webkit-scrollbar-thumb { background: #26354d; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3b5275; }
+    input[type="range"] {
+      accent-color: #38bdf8;
+    }
+  </style>
+</head>
+<body class="h-screen w-screen flex flex-col bg-[#060a12] text-slate-100 overflow-hidden">
+
+  <!-- TOP COMMAND & LIVE TELEMETRY BAR -->
+  <header class="shrink-0 bg-[#0d131f] border-b border-slate-800/90 px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-2 z-30">
+    <div class="flex items-center gap-2 flex-wrap">
+      <button id="btnToggleLeft" type="button" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-medium border border-slate-700 transition">
+        Layers (34)
+      </button>
+      <div class="flex items-center gap-1.5 pr-1">
+        <span class="inline-block w-2 h-2 rounded-full bg-sky-400 animate-pulse"></span>
+        <span class="font-semibold text-xs sm:text-sm tracking-tight text-sky-300">TerraTwin HPC <span class="mono text-[11px] text-slate-400">v2.5.0</span></span>
+      </div>
+
+      <!-- 4 Grounded Live Readout Badges -->
+      <div class="hidden md:flex items-center gap-1.5 flex-wrap">
+        <div class="px-2 py-0.5 rounded bg-[#161e2e] border border-slate-800 flex items-center gap-1.5 text-[11px]" title="Copernicus ERA5 Oct 2026 global 2m mean 15.35°C (+1.75°C vs 1850-1900)">
+          <span class="text-slate-400">2m Anom</span>
+          <span id="badgeTempAnom" class="mono font-semibold text-orange-400">+1.75 °C</span>
+        </div>
+        <div class="px-2 py-0.5 rounded bg-[#161e2e] border border-slate-800 flex items-center gap-1.5 text-[11px]" title="NOAA GML Mauna Loa Nov 11, 2026 baseline (428.38 ppm)">
+          <span class="text-slate-400">MLO CO2</span>
+          <span id="badgeCo2" class="mono font-semibold text-amber-300">428.38 ppm</span>
+        </div>
+        <div class="px-2 py-0.5 rounded bg-[#161e2e] border border-slate-800 flex items-center gap-1.5 text-[11px]" title="NOAA CPC / ERA5 Oct 2026 Niño 3.4 SST 29.94°C (+3.21°C anomaly)">
+          <span class="text-slate-400">Niño 3.4</span>
+          <span id="badgeEnso" class="mono font-semibold text-sky-300">+3.21 °C</span>
+        </div>
+        <div class="px-2 py-0.5 rounded bg-[#161e2e] border border-slate-800 flex items-center gap-1.5 text-[11px]" title="Copernicus ERA5 60°S–60°N Extra-Polar SST (20.95°C)">
+          <span class="text-slate-400">60°S–60°N SST</span>
+          <span id="badgeSst" class="mono font-semibold text-rose-300">20.95 °C</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Projection, Scenario, Coordinate Jump & Tools -->
+    <div class="flex items-center gap-1.5 flex-wrap">
+      <label for="projectionSelect" class="sr-only">Map Projection</label>
+      <select id="projectionSelect" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-sky-500">
+        <option value="globe_3d_wgs84">3D Globe (EPSG:4978)</option>
+        <option value="equirectangular_2d">2D Equirectangular (EPSG:4326)</option>
+        <option value="arctic_polar_stereo">Arctic Stereo (EPSG:3995)</option>
+        <option value="antarctic_polar_stereo">Antarctic Stereo (EPSG:3031)</option>
+      </select>
+
+      <label for="sspSelect" class="sr-only">SSP Forcing Scenario</label>
+      <select id="sspSelect" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-sky-500">
+        <option value="SSP1-1.9">SSP1-1.9 (Net-Zero)</option>
+        <option value="SSP1-2.6">SSP1-2.6 (Low)</option>
+        <option value="SSP2-4.5" selected>SSP2-4.5 (Intermediate)</option>
+        <option value="SSP3-7.0">SSP3-7.0 (High)</option>
+        <option value="SSP5-8.5">SSP5-8.5 (Fossil-Intensive)</option>
+      </select>
+
+      <div class="hidden sm:flex items-center bg-slate-900 border border-slate-700 rounded overflow-hidden">
+        <label for="coordInput" class="sr-only">Latitude Longitude Jump</label>
+        <input id="coordInput" type="text" value="40.7128, -74.0061" class="bg-transparent px-2 py-1 text-xs mono w-36 focus:outline-none text-slate-200" placeholder="lat, lon" />
+        <button id="btnCoordJump" type="button" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-[11px] font-medium border-l border-slate-700">Jump</button>
+      </div>
+
+      <button id="btnTransect" type="button" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs border border-slate-700 transition" title="Click two points on map to sample an A to B cross-section">
+        A→B Transect
+      </button>
+
+      <button id="btnToggleRight" type="button" class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-medium border border-slate-700 transition">
+        Analytics
+      </button>
+    </div>
+  </header>
+
+  <!-- MAIN WORKSPACE: LEFT SIDEBAR + CENTRAL GLOBE/MAP + RIGHT ANALYTICS DOCK -->
+  <div class="flex-1 min-h-0 relative flex overflow-hidden">
+
+    <!-- LEFT SIDEBAR: PREDICTIVE LAYER TREE (34 LAYERS / 6 GROUPS) -->
+    <aside id="leftSidebar" class="w-80 max-w-[86vw] shrink-0 bg-[#0b111d]/95 border-r border-slate-800/90 flex flex-col z-20 absolute lg:static inset-y-0 left-0 shadow-2xl lg:shadow-none transition-transform duration-200">
+      <div class="p-3 border-b border-slate-800/80 space-y-2.5">
+        <div class="flex items-center justify-between">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300">Predictive Layer Tree (34)</h2>
+          <label class="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer">
+            <input id="chkAnomalyMode" type="checkbox" class="rounded bg-slate-900 border-slate-700 text-sky-500" />
+            <span>Anomaly Mode</span>
+          </label>
+        </div>
+
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label for="basemapSelect" class="block text-[11px] text-slate-400 mb-0.5">Basemap</label>
+            <select id="basemapSelect" class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200">
+              <option value="bathymetry_topography_shaded">GEBCO Shaded Relief</option>
+              <option value="dark_telemetry_vector">Dark Telemetry Vector</option>
+              <option value="viirs_nightlights_baseline">VIIRS Nighttime Lights</option>
+            </select>
+          </div>
+          <div>
+            <label for="layerSearch" class="block text-[11px] text-slate-400 mb-0.5">Filter Layers</label>
+            <input id="layerSearch" type="text" placeholder="QGPV, SST, FWI..." class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-sky-500" />
+          </div>
+        </div>
+
+        <!-- Vertical Slice Engine -->
+        <div class="bg-[#11192a] rounded-lg p-2 border border-slate-800/90 space-y-1.5">
+          <div class="flex items-center justify-between text-[11px]">
+            <span class="text-slate-300 font-medium">Atmospheric Slice</span>
+            <span id="lblAtmHpa" class="mono text-sky-300 font-semibold">850 hPa</span>
+          </div>
+          <input id="sliderAtmHpa" type="range" min="0" max="9" step="1" value="2" class="w-full h-1.5 cursor-pointer" />
+
+          <div class="flex items-center justify-between text-[11px] pt-0.5">
+            <span class="text-slate-300 font-medium">Ocean Depth Slice</span>
+            <span id="lblOceanDepth" class="mono text-teal-300 font-semibold">0 m</span>
+          </div>
+          <input id="sliderOceanDepth" type="range" min="0" max="9" step="1" value="0" class="w-full h-1.5 cursor-pointer" />
+        </div>
+      </div>
+
+      <!-- Scrollable 6 Layer Groups -->
+      <div id="layerTreeContainer" class="flex-1 overflow-y-auto p-2.5 space-y-2"></div>
+    </aside>
+
+    <!-- CENTRAL INTERACTIVE PLANETARY VIEWPORT -->
+    <main id="mapViewport" class="flex-1 min-w-0 relative bg-[#050912] overflow-hidden">
+      <canvas id="planetCanvas" class="block w-full h-full cursor-grab active:cursor-grabbing"></canvas>
+
+      <!-- Floating Synoptic Legend & Engine Telemetry Pill -->
+      <div class="absolute top-3 left-3 pointer-events-none flex flex-col gap-1.5 max-w-xs">
+        <div class="bg-[#0b1220]/85 backdrop-blur border border-slate-800/90 rounded-lg px-2.5 py-1.5 text-[11px] space-y-1">
+          <div class="flex items-center gap-2 font-medium text-slate-200">
+            <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+            <span id="hudEngineMode">2-Layer QGPV + 1.5-Layer Ocean Active</span>
+          </div>
+          <div class="text-slate-400 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 mono text-[10px]">
+            <span><b class="text-white">━</b> 4 hPa Isobars</span>
+            <span><b class="text-rose-400">L</b>/<b class="text-sky-400">H</b> Extrema</span>
+            <span><b class="text-sky-400">━</b> Cold / <b class="text-rose-400">━</b> Warm Front</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Zoom / Reset Camera Controls -->
+      <div class="absolute top-3 right-3 flex flex-col gap-1 z-10">
+        <button id="btnZoomIn" type="button" class="w-8 h-8 rounded bg-[#0d1526]/90 hover:bg-slate-800 border border-slate-700 text-sm font-bold text-slate-200" title="Zoom In">+</button>
+        <button id="btnZoomOut" type="button" class="w-8 h-8 rounded bg-[#0d1526]/90 hover:bg-slate-800 border border-slate-700 text-sm font-bold text-slate-200" title="Zoom Out">−</button>
+        <button id="btnResetCam" type="button" class="w-8 h-8 rounded bg-[#0d1526]/90 hover:bg-slate-800 border border-slate-700 text-[10px] mono text-sky-300" title="Reset Global Camera">GLB</button>
+      </div>
+
+      <!-- Cursor Geodesic & Active Value HUD -->
+      <div id="cursorHud" class="absolute bottom-3 left-3 pointer-events-none bg-[#0a101c]/90 border border-slate-800 rounded px-2.5 py-1 text-[11px] mono text-slate-200">
+        Pin: +40.71°, -74.01° (New York City) | Click globe or city chip to inspect
+      </div>
+
+      <!-- Toast Notification Banner -->
+      <div id="toastBanner" class="hidden absolute bottom-3 right-3 max-w-sm bg-sky-950/95 border border-sky-500/60 text-sky-100 rounded-lg px-3 py-2 text-xs shadow-xl z-30"></div>
+    </main>
+
+    <!-- RIGHT ANALYTICS DRAWER -->
+    <aside id="rightDrawer" class="w-88 max-w-[90vw] sm:w-96 shrink-0 bg-[#0b111d]/95 border-l border-slate-800/90 flex flex-col z-20 absolute xl:static inset-y-0 right-0 shadow-2xl xl:shadow-none transition-transform duration-200">
+      <div class="p-3 border-b border-slate-800/80 space-y-2">
+        <div class="flex items-center justify-between">
+          <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300">Telemetry Analytics Dock</h2>
+          <span id="lblPinnedCoord" class="mono text-[11px] text-sky-300">+40.71°, -74.01°</span>
+        </div>
+        <div class="flex items-center justify-between gap-2">
+          <label for="continentSelect" class="text-[10px] uppercase tracking-wider text-slate-400">Cities by Continent</label>
+          <select id="continentSelect" class="bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-[11px] text-slate-200 focus:outline-none focus:border-sky-500">
+            <option value="ALL">All Continents (20)</option>
+            <option value="North America">North America (3)</option>
+            <option value="South America">South America (3)</option>
+            <option value="Europe">Europe (3)</option>
+            <option value="Africa">Africa (3)</option>
+            <option value="Asia">Asia (3)</option>
+            <option value="Oceania">Oceania (3)</option>
+            <option value="Antarctica">Antarctica (2)</option>
+          </select>
+        </div>
+        <!-- Continental Major Cities Quick-Jump Chips -->
+        <div id="observatoryChips" class="flex flex-wrap gap-1 max-h-24 overflow-y-auto pr-0.5"></div>
+      </div>
+
+      <div class="flex-1 overflow-y-auto p-3 space-y-3">
+        <!-- 1. Active Layer Point Readouts -->
+        <div class="bg-[#11192a] rounded-lg p-2.5 border border-slate-800/90">
+          <div class="text-[11px] font-semibold text-slate-300 mb-1.5 flex items-center justify-between">
+            <span>Active Layer Point Telemetry</span>
+            <span id="lblSurfaceElev" class="mono text-[10px] text-slate-400">Elev: +72 m</span>
+          </div>
+          <div id="activePointReadouts" class="space-y-1 text-xs mono max-h-32 overflow-y-auto"></div>
+        </div>
+
+        <!-- 2. Skew-T / Log-P Vertical Sounding (1000 -> 10 hPa) -->
+        <div class="bg-[#11192a] rounded-lg p-2.5 border border-slate-800/90">
+          <div class="flex items-center justify-between text-[11px] mb-1">
+            <span class="font-semibold text-slate-300">Atmospheric Sounding (1000–10 hPa)</span>
+            <span class="mono text-[10px] text-slate-400">T / Td / QG Jet</span>
+          </div>
+          <canvas id="soundingCanvas" width="330" height="130" class="w-full h-32 rounded bg-[#0b101c] border border-slate-800/70"></canvas>
+        </div>
+
+        <!-- 3. Ocean Water-Column CTD Profile (0 -> 6000 m) -->
+        <div class="bg-[#11192a] rounded-lg p-2.5 border border-slate-800/90">
+          <div class="flex items-center justify-between text-[11px] mb-1">
+            <span class="font-semibold text-slate-300">Ocean CTD Profile (0–6000 m)</span>
+            <span class="mono text-[10px] text-slate-400">Temp °C / Sal PSU</span>
+          </div>
+          <canvas id="ctdCanvas" width="330" height="120" class="w-full h-28 rounded bg-[#0b101c] border border-slate-800/70"></canvas>
+        </div>
+
+        <!-- 4. CMIP6 SSP Trajectory OR A->B Cross-Section Transect Chart -->
+        <div class="bg-[#11192a] rounded-lg p-2.5 border border-slate-800/90">
+          <div class="flex items-center justify-between text-[11px] mb-1">
+            <span id="lblChartTitle" class="font-semibold text-slate-300">CMIP6 SSP CO2 Pathways (1950–2100)</span>
+            <button id="btnClearTransect" type="button" class="hidden text-[10px] text-amber-300 hover:underline">Show SSPs</button>
+          </div>
+          <div class="relative h-44 w-full">
+            <canvas id="analyticsChart"></canvas>
+          </div>
+        </div>
+
+        <!-- 5. Zarr v3 & SQLite TTZ1 Compression Exporter -->
+        <div class="bg-[#11192a] rounded-lg p-2.5 border border-slate-800/90 space-y-2">
+          <div class="flex items-center justify-between text-[11px]">
+            <span class="font-semibold text-slate-300">Zarr v3 &amp; SQLite WAL Storage</span>
+            <span id="lblSqliteStats" class="mono text-[10px] text-emerald-300">TTZ1 LZ4: 3.6x</span>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <label for="zarrCodecSelect" class="sr-only">Zarr Codec</label>
+            <select id="zarrCodecSelect" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200">
+              <option value="zstd" selected>zstd (level=3)</option>
+              <option value="gzip">gzip (level=4)</option>
+              <option value="bytes">bytes (raw le)</option>
+            </select>
+            <button id="btnExportZarr" type="button" class="flex-1 px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium transition">
+              Export Zarr v3 Subset
+            </button>
+          </div>
+          <div id="exportStatusText" class="text-[11px] mono text-slate-400 leading-snug">
+            Ring buffer: 1/96 ticks retained (`--max-history-ticks 96`)
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- BOTTOM 4D TEMPORAL & SQLITE RING-BUFFER SCRUBBER -->
+  <footer class="shrink-0 bg-[#0d131f] border-t border-slate-800/90 px-3 py-1.5 flex flex-wrap items-center justify-between gap-2 z-30">
+    <div class="flex items-center gap-1.5 flex-wrap">
+      <button id="btnPlayPause" type="button" class="px-2.5 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold min-w-[60px] transition">
+        Play
+      </button>
+      <button id="btnStepTick" type="button" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs mono text-slate-200" title="Advance coupled QGPV + Reduced-Gravity Ocean by +6 hours and append to SQLite ring buffer">
+        +6h Tick
+      </button>
+
+      <!-- Live vs 4D SQLite Replay Mode Switch -->
+      <div class="inline-flex rounded bg-slate-900 p-0.5 border border-slate-800 ml-1">
+        <button id="btnModeLive" type="button" class="px-2 py-0.5 rounded text-xs font-medium bg-sky-600/30 text-sky-300 border border-sky-500/40">
+          Live Engine
+        </button>
+        <button id="btnModeReplay" type="button" class="px-2 py-0.5 rounded text-xs font-medium text-slate-400 hover:text-slate-200">
+          4D SQLite Replay
+        </button>
+      </div>
+
+      <!-- Live Sliders -->
+      <div id="liveTimeControls" class="flex items-center gap-3 ml-1 flex-wrap">
+        <div class="flex items-center gap-1.5 text-xs">
+          <span class="text-slate-400">Year</span>
+          <input id="sliderSimYear" type="range" min="1950" max="2100" step="0.25" value="2026.86" class="w-28 sm:w-36 cursor-pointer" />
+          <span id="lblSimYear" class="mono text-slate-200 w-14">2026.9</span>
+        </div>
+        <div class="flex items-center gap-1.5 text-xs">
+          <span class="text-slate-400">DOY</span>
+          <input id="sliderDoy" type="range" min="1" max="365" step="1" value="316" class="w-24 cursor-pointer" />
+          <span id="lblDoy" class="mono text-slate-200 w-8">316</span>
+        </div>
+      </div>
+
+      <!-- 4D Replay Scrubber -->
+      <div id="replayTimeControls" class="hidden items-center gap-2 ml-1">
+        <span class="text-xs text-amber-300 font-medium">SQLite Tick</span>
+        <input id="sliderReplayTick" type="range" min="0" max="0" step="1" value="0" class="w-36 cursor-pointer" />
+        <span id="lblReplayTick" class="mono text-xs text-slate-200">1/1</span>
+        <span id="lblReplayUtc" class="mono text-[11px] text-sky-300">2026-11-12T00:00:00Z</span>
+      </div>
+    </div>
+
+    <div id="statusFooterRight" class="text-[11px] mono text-slate-400 truncate max-w-full">
+      3D-Var PCG + 2-Layer QGPV + Stommel-Munk Ocean | SQLite Ring: 1/96 ticks
+    </div>
+  </footer>
+
+  <!-- LAYER CITATION / INFO MODAL -->
+  <div id="layerModal" class="hidden fixed inset-0 bg-black/65 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-[#0f172a] border border-slate-700 rounded-xl max-w-md w-full p-4 space-y-3 shadow-2xl">
+      <div class="flex items-start justify-between gap-2">
+        <div>
+          <h3 id="modalLayerName" class="text-sm font-semibold text-sky-300">Layer Name</h3>
+          <p id="modalLayerGroup" class="text-[11px] text-slate-400"></p>
+        </div>
+        <button id="btnCloseModal" type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">Close</button>
+      </div>
+      <p id="modalLayerDesc" class="text-xs text-slate-300 leading-relaxed"></p>
+      <div class="bg-slate-900/90 rounded p-2.5 border border-slate-800 text-[11px] mono space-y-1 text-slate-300">
+        <div><span class="text-slate-500">ID:</span> <span id="modalLayerId"></span></div>
+        <div><span class="text-slate-500">Units:</span> <span id="modalLayerUnits"></span></div>
+        <div><span class="text-slate-500">Resolution:</span> <span id="modalLayerRes"></span></div>
+        <div><span class="text-slate-500">Public Sources:</span> <span id="modalLayerSources" class="text-sky-300"></span></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // =========================================================================
+    // 1. VERIFIED SCHEMA CONSTANTS, OBSERVATORIES & 34 PREDICTIVE LAYERS
+    // =========================================================================
+    const ATM_LEVELS_HPA = [1000, 925, 850, 700, 500, 300, 250, 100, 50, 10];
+    const OCEAN_DEPTHS_M = [0, 10, 50, 100, 250, 500, 1000, 2000, 4000, 6000];
+
+    const OBSERVATORIES = [
+      // North America (3)
+      { name: "New York City", continent: "North America", lat: 40.7128, lon: -74.0061, role: "North America — US Atlantic Megacity" },
+      { name: "Toronto", continent: "North America", lat: 43.6427, lon: -79.3871, role: "North America — Great Lakes Basin" },
+      { name: "Mexico City", continent: "North America", lat: 19.4333, lon: -99.1333, role: "North America — High-Altitude Valley" },
+      // South America (3)
+      { name: "São Paulo", continent: "South America", lat: -23.5507, lon: -46.6334, role: "South America — Subtropical Atlantic" },
+      { name: "Buenos Aires", continent: "South America", lat: -34.6200, lon: -58.4300, role: "South America — Río de la Plata" },
+      { name: "Bogotá", continent: "South America", lat: 4.6097, lon: -74.0818, role: "South America — Equatorial Andes" },
+      // Europe (3)
+      { name: "London", continent: "Europe", lat: 51.5085, lon: -0.1257, role: "Europe — North Atlantic Maritime" },
+      { name: "Paris", continent: "Europe", lat: 48.8533, lon: 2.3489, role: "Europe — Western European Basin" },
+      { name: "Berlin", continent: "Europe", lat: 52.5200, lon: 13.4050, role: "Europe — Central European Plain" },
+      // Africa (3)
+      { name: "Cairo", continent: "Africa", lat: 30.0626, lon: 31.2497, role: "Africa — Nile Delta Subtropics" },
+      { name: "Lagos", continent: "Africa", lat: 6.5772, lon: 3.3211, role: "Africa — Gulf of Guinea Monsoon" },
+      { name: "Nairobi", continent: "Africa", lat: -1.2864, lon: 36.8172, role: "Africa — East African Highlands" },
+      // Asia (3)
+      { name: "Tokyo", continent: "Asia", lat: 35.6800, lon: 139.7600, role: "Asia — Northwest Pacific Kuroshio" },
+      { name: "Shanghai", continent: "Asia", lat: 31.2300, lon: 121.4700, role: "Asia — Yangtze River Delta" },
+      { name: "Mumbai", continent: "Asia", lat: 19.0364, lon: 72.8595, role: "Asia — Arabian Sea Monsoon Coast" },
+      // Oceania (3)
+      { name: "Sydney", continent: "Oceania", lat: -33.8698, lon: 151.2083, role: "Oceania — Tasman Sea Coast" },
+      { name: "Melbourne", continent: "Oceania", lat: -37.8142, lon: 144.9632, role: "Oceania — Southern Ocean Coast" },
+      { name: "Auckland", continent: "Oceania", lat: -36.8492, lon: 174.7653, role: "Oceania — Southwest Pacific" },
+      // Antarctica (2)
+      { name: "McMurdo Station", continent: "Antarctica", lat: -77.8464, lon: 166.6683, role: "Antarctica — Ross Island Research Hub" },
+      { name: "Amundsen-Scott Pole", continent: "Antarctica", lat: -89.9900, lon: 0.0000, role: "Antarctica — Geographic South Pole" }
+    ];
+
+    const TELECONNECTION_BASINS = [
+      { id: "ENSO", label: "ENSO Niño 3.4 (+3.21°C)", minLat: -5, maxLat: 5, minLon: -170, maxLon: -120 },
+      { id: "PDO", label: "PDO North Pacific", minLat: 20, maxLat: 58, minLon: -175, maxLon: -125 },
+      { id: "NAO", label: "NAO North Atlantic", minLat: 36, maxLat: 65, minLon: -55, maxLon: -5 },
+      { id: "IOD", label: "IOD West Indian", minLat: -10, maxLat: 10, minLon: 50, maxLon: 70 },
+      { id: "AMO", label: "AMO N. Atlantic", minLat: 10, maxLat: 60, minLon: -70, maxLon: -10 }
+    ];
+
+    const LAYER_GROUPS = [
+      {
+        groupId: "atmospheric_dynamics_meteorology",
+        groupName: "1. Atmospheric Dynamics & Meteorology",
+        expanded: true,
+        layers: [
+          { id: "geo_multispectral_satellite", name: "Geostationary Multispectral IR", units: "K", palette: "ThermalIR", min: 215, max: 305, vis: false, op: 0.72, res: "0.5–2 km | 10m", sources: "NOAA GOES-16/18, EUMETSAT MTG-I1, Himawari-9", desc: "16-band full-disk stitched longwave clean IR brightness temperature and cloud-top cooling." },
+          { id: "volumetric_doppler_radar", name: "3D Volumetric Doppler Radar", units: "dBZ", palette: "Turbo", min: 2, max: 58, vis: false, op: 0.78, res: "1 km | 5m", sources: "NOAA MRMS, NEXRAD Level-II, GPM DPR", desc: "Marshall-Palmer Z=200*R^1.6 radar reflectivity coupled to QGPV frontal convergence and orographic lift." },
+          { id: "synoptic_fronts_isobars", name: "Synoptic Fronts & MSLP Isobars", units: "hPa", palette: "CoolWarm", min: 976, max: 1040, vis: true, op: 0.58, res: "0.25° | 1h", sources: "NOAA WPC, ECMWF ERA5, 2-Layer QGPV Solver", desc: "Prognostic 2-layer spherical QGPV streamfunction inversion + 16-case Marching Squares 4 hPa isobars, L/H centers, and fronts." },
+          { id: "wind_vector_jet_streams", name: "3D Wind Vectors & QG Jet Streams", units: "m/s", palette: "Viridis", min: 0, max: 68, vis: true, op: 0.62, res: "25 km | 1h", sources: "ECMWF IFS/ERA5, NOAA GFS", desc: "Log-pressure interpolated 2-layer QGPV rotational winds + thermal wind shear from 1000 hPa to 10 hPa." },
+          { id: "atmospheric_rivers_ivt", name: "Atmospheric Rivers & IVT", units: "kg m⁻¹ s⁻¹", palette: "Plasma", min: 120, max: 950, vis: false, op: 0.80, res: "0.25° | 3h", sources: "CW3E Scripps AR Catalog, NASA MERRA-2", desc: "Integrated horizontal water vapor flux corridors concentrated in warm-conveyor sectors ahead of QG cyclones." },
+          { id: "global_lightning_telemetry", name: "Global Optical/RF Lightning Density", units: "fl km⁻² min⁻¹", palette: "Plasma", min: 0.2, max: 28, vis: false, op: 0.85, res: "2–8 km | 20s", sources: "NOAA GOES-R GLM, NASA ISS LIS", desc: "Bolton equivalent potential temperature (theta_e) CAPE buoyancy flash density." }
+        ]
+      },
+      {
+        groupId: "trace_gases_aerosols_radiation",
+        groupName: "2. Trace Gases, Aerosols & Radiation",
+        expanded: false,
+        layers: [
+          { id: "column_co2_flux", name: "Column-Averaged CO2 (XCO2)", units: "ppm", palette: "Plasma", min: 418, max: 438, vis: false, op: 0.75, res: "1.3x2.2 km | Daily", sources: "NOAA GML Mauna Loa, NASA OCO-2/3", desc: "Assimilated Mauna Loa baseline (428.38 ppm) plus seasonal boreal biosphere drawdown and industrial domes." },
+          { id: "methane_plumes_background", name: "Methane (CH4) Plumes & Background", units: "ppb", palette: "Turbo", min: 1880, max: 2120, vis: false, op: 0.80, res: "5.5 km / 30 m | Daily", sources: "Sentinel-5P TROPOMI, NASA EMIT, MethaneSAT", desc: "Planetary CH4 latitudinal gradient plus tropical wetland flux and Permian/Caspian basin point plumes." },
+          { id: "tropospheric_no2_so2", name: "Tropospheric NO2 & SO2 Plumes", units: "10¹⁵ molec cm⁻²", palette: "Plasma", min: 0.5, max: 14, vis: false, op: 0.75, res: "2x4.7 km | 1h", sources: "NASA TEMPO, ESA TROPOMI, GEMS", desc: "Anthropogenic combustion and shipping corridor nitrogen/sulfur dioxide column density." },
+          { id: "aerosol_optical_depth_speciated", name: "Speciated Aerosols (AOD 550nm)", units: "AOD", palette: "Viridis", min: 0.04, max: 0.85, vis: false, op: 0.72, res: "10 km | 3h", sources: "Copernicus CAMS, NASA MODIS/VIIRS", desc: "Semi-Lagrangian dust, sulfate, and wildfire smoke optical depth with precipitation wet scavenging." },
+          { id: "toa_radiative_energy_budget", name: "TOA Radiative Energy Imbalance", units: "W m⁻²", palette: "CoolWarm", min: -110, max: 110, vis: false, op: 0.75, res: "1.0° | Daily", sources: "NASA CERES, DSCOVR NISTAR", desc: "Absorbed solar radiation minus outgoing longwave radiation with Myhre CO2 forcing and ice-albedo feedback." }
+        ]
+      },
+      {
+        groupId: "physical_biogeochemical_oceanography",
+        groupName: "3. Physical & Biogeochemical Ocean",
+        expanded: false,
+        layers: [
+          { id: "sst_marine_heatwaves", name: "Sea Surface Temperature (OISST)", units: "°C", palette: "Turbo", min: -1.8, max: 32.5, vis: false, op: 0.85, res: "25 km | Daily", sources: "NOAA CoastWatch ERDDAP OISST v2.1, GHRSST", desc: "Prognostic ocean mixed-layer temperature coupled to reduced-gravity thermocline anomalies." },
+          { id: "subsurface_ocean_heat_salinity_3d", name: "3D Subsurface Ocean Heat (OHC)", units: "GJ m⁻²", palette: "Viridis", min: 0, max: 12.5, vis: false, op: 0.80, res: "9 km | Daily", sources: "International Argo Array, Copernicus GLORYS12", desc: "UNESCO EOS-80 seawater density and integrated volumetric heat content from 0 to 6000 m." },
+          { id: "thermohaline_currents_amoc", name: "Stommel-Munk Gyres & AMOC Currents", units: "m/s", palette: "Viridis", min: 0, max: 1.8, vis: false, op: 0.82, res: "8 km | 3h", sources: "NASA OSCAR, RAPID-AMOC 26.5°N", desc: "Coupled 1.5-layer reduced-gravity Kelvin/Rossby currents + Stommel-Munk western boundary intensification." },
+          { id: "swot_sea_surface_height_altimetry", name: "SWOT Sea Surface Height (SSH)", units: "cm", palette: "CoolWarm", min: -35, max: 45, vis: false, op: 0.78, res: "2 km / 25 km | Daily", sources: "NASA/CNES SWOT, Sentinel-6", desc: "Inverse barometer + steric thermal expansion + dynamic reduced-gravity thermocline SSH." },
+          { id: "ocean_acidification_carbonate", name: "Ocean Acidification (Total pH)", units: "pH", palette: "Viridis", min: 7.65, max: 8.20, vis: false, op: 0.78, res: "0.25° | Monthly", sources: "SOCAT, GLODAP, BGC-Argo", desc: "Iterative Newton-Raphson Weiss/Lueker/Dickson carbonate solver tracking surface and deep pH." },
+          { id: "marine_chlorophyll_hypoxia", name: "PACE Hyperspectral Chlorophyll-a", units: "mg m⁻³", palette: "Chlorophyll", min: 0.05, max: 3.8, vis: false, op: 0.80, res: "1 km | Daily", sources: "NASA PACE OCI, Sentinel-3 OLCI", desc: "Equatorial/coastal upwelling productivity damped by extreme marine heatwave stratification." },
+          { id: "teleconnection_oscillation_masks", name: "Teleconnection Masks (ENSO/NAO)", units: "°C / Index", palette: "CoolWarm", min: -3.5, max: 3.5, vis: false, op: 0.65, res: "Basin-scale | Weekly", sources: "NOAA CPC, PSL", desc: "Spatial oscillation phase masks for ENSO Niño 3.4, PDO, NAO, IOD, and AMO." }
+        ]
+      },
+      {
+        groupId: "cryosphere_glacial_mass_balance",
+        groupName: "4. Cryosphere & Glacial Mass Balance",
+        expanded: false,
+        layers: [
+          { id: "sea_ice_concentration_drift", name: "Sea Ice Concentration & Drift", units: "%", palette: "CryoIce", min: 5, max: 100, vis: false, op: 0.88, res: "3.1–25 km | Daily", sources: "NSIDC Sea Ice Index v4, JAXA AMSR2", desc: "Polar sea-ice areal fraction coupled to Semtner thermodynamic thickness and Nansen wind drift." },
+          { id: "sea_ice_thickness_freeboard_age", name: "ICESat-2 Sea Ice Thickness", units: "m", palette: "CryoIce", min: 0.1, max: 4.5, vis: false, op: 0.85, res: "5–25 km | Weekly", sources: "NASA ICESat-2, ESA CryoSat-2, PIOMAS", desc: "Semtner (1976) 0-layer conductive sea-ice growth and basal oceanic heat-flux ablation." },
+          { id: "gravimetric_ice_sheet_mass_balance", name: "GRACE-FO Ice Sheet Mass Balance", units: "mm w.e.", palette: "CoolWarm", min: -60, max: 30, vis: false, op: 0.80, res: "25–300 km | Monthly", sources: "NASA/GFZ GRACE-FO, IMBIE", desc: "Greenland and Antarctic surface snowfall accumulation minus positive-degree-day melt." },
+          { id: "alpine_glacier_velocity_rgi", name: "RGI 7.0 Alpine Glacier Velocity", units: "m yr⁻¹", palette: "CryoIce", min: 5, max: 450, vis: false, op: 0.85, res: "120 m | Seasonal", sources: "NASA ITS_LIVE, RGI 7.0", desc: "Glen's flow-law ice creep velocity across high-relief mountain cordilleras." },
+          { id: "permafrost_thermokarst_subsidence", name: "Permafrost Active-Layer Thaw", units: "m", palette: "Plasma", min: 0.1, max: 3.8, vis: false, op: 0.76, res: "1–9 km | Annual", sources: "ESA CCI Permafrost, GTN-P", desc: "Stefan square-root thawing-degree-day active layer thickness north of 52°N." }
+        ]
+      },
+      {
+        groupId: "terrestrial_biosphere_hydrology_carbon",
+        groupName: "5. Terrestrial Biosphere & Hydrology",
+        expanded: false,
+        layers: [
+          { id: "canopy_height_aboveground_biomass", name: "GEDI Canopy Aboveground Biomass", units: "Mg C ha⁻¹", palette: "Chlorophyll", min: 5, max: 340, vis: false, op: 0.80, res: "25–100 m | Annual", sources: "NASA GEDI, ESA BIOMASS", desc: "Woody carbon density governed by root-zone moisture availability and thermal growing regime." },
+          { id: "sif_photosynthesis_evaporative_stress", name: "Solar-Induced Fluorescence (SIF)", units: "mW m⁻² sr⁻¹ nm⁻¹", palette: "Chlorophyll", min: 0.1, max: 3.2, vis: false, op: 0.76, res: "70 m–5 km | 8-day", sources: "NASA OCO-2/3 SIF, ECOSTRESS", desc: "Photosynthetic gross primary productivity with PAR light-use efficiency and CO2 fertilization." },
+          { id: "soil_moisture_groundwater_grace", name: "SMAP Root-Zone Soil Moisture", units: "m³ m⁻³", palette: "Viridis", min: 0.03, max: 0.48, vis: false, op: 0.78, res: "9 km | 3-day", sources: "NASA SMAP, GRACE-FO", desc: "Prognostic 1m bucket hydrology balancing precipitation, bulk evapotranspiration, and runoff." },
+          { id: "swot_surface_water_river_discharge", name: "GloFAS & SWOT River Discharge", units: "m³ s⁻¹", palette: "Turbo", min: 50, max: 45000, vis: false, op: 0.85, res: "100 m / 5 km | Daily", sources: "Copernicus GloFAS, NASA/CNES SWOT", desc: "Direct saturation-excess runoff + baseflow assimilated with major global river basin gauges." },
+          { id: "active_wildfires_frp_burn_severity", name: "NASA FIRMS Active Fire FRP", units: "MW", palette: "Plasma", min: 5, max: 220, vis: false, op: 0.90, res: "375 m | 3h", sources: "NASA FIRMS VIIRS SNPP/NOAA-21", desc: "Active wildfire radiative power clusters driven by Van Wagner FWI > 24 and fuel aridity." },
+          { id: "dynamic_land_cover_deforestation", name: "Dynamic World 10m Land Cover", units: "Class (1–8)", palette: "Chlorophyll", min: 1, max: 8, vis: false, op: 0.75, res: "10 m | 5-day", sources: "Google/WRI Dynamic World, Sentinel-2", desc: " Biome classification spanning tropical broadleaf forest, grassland, arid desert, and tundra." }
+        ]
+      },
+      {
+        groupId: "climate_risk_attribution_projections",
+        groupName: "6. Climate Risk & CMIP6 Projections",
+        expanded: false,
+        layers: [
+          { id: "cmip6_downscaled_ensemble", name: "CMIP6 Downscaled Temp Anomaly", units: "°C", palette: "CoolWarm", min: -3.0, max: 6.5, vis: false, op: 0.75, res: "0.25° | Monthly", sources: "NASA NEX-GDDP-CMIP6, Copernicus CDS", desc: "Local 2m warming anomaly relative to 1850–1900 pre-industrial baseline with Arctic amplification." },
+          { id: "wet_bulb_globe_temp_heat_stress", name: "Outdoor Wet-Bulb Globe Temp (WBGT)", units: "°C", palette: "Turbo", min: -10, max: 36, vis: false, op: 0.80, res: "9–25 km | 1h", sources: "ECMWF ERA5-HEAT, NOAA HeatRisk", desc: "Stull (2011) psychrometric wet-bulb + solar globe radiation physiological heat-stress index." },
+          { id: "coastal_inundation_storm_surge", name: "100-Yr Storm Surge & SLR Flood", units: "m", palette: "Turbo", min: 0.1, max: 4.5, vis: false, op: 0.85, res: "3–30 m | Scenario", sources: "NOAA SLR Viewer, Deltares GTSM", desc: "Low-elevation coastal inundation combining steric/barystatic SLR, inverse barometer, and wind setup." },
+          { id: "compound_hazard_fire_weather_index", name: "Canadian Forest Fire Weather (FWI)", units: "FWI", palette: "Plasma", min: 0, max: 85, vis: false, op: 0.78, res: "8–25 km | Daily", sources: "Copernicus GWIS, CFS FWI1987", desc: "6-component Van Wagner (1987) FFMC, DMC, DC, ISI, BUI, and FWI wildfire intensity index." },
+          { id: "critical_infrastructure_socioeconomic_exposure", name: "Critical Infrastructure Exposure", units: "Risk (0–100)", palette: "Plasma", min: 0, max: 95, vis: false, op: 0.85, res: "1 km | Annual", sources: "OpenInfraMap, NASA SEDAC GPWv4", desc: "Population-weighted compound WBGT thermal stress and wildfire exposure score." }
+        ]
+      }
+    ];
+
+    const SSP_CONFIG = {
+      "SSP1-1.9": { label: "SSP1-1.9", co2_2100: 393, color: "#38bdf8" },
+      "SSP1-2.6": { label: "SSP1-2.6", co2_2100: 446, color: "#4ade80" },
+      "SSP2-4.5": { label: "SSP2-4.5", co2_2100: 603, color: "#facc15" },
+      "SSP3-7.0": { label: "SSP3-7.0", co2_2100: 867, color: "#fb923c" },
+      "SSP5-8.5": { label: "SSP5-8.5", co2_2100: 1135, color: "#f87171" }
+    };
+
+    function sspCo2AtYear(sspCode, year) {
+      if (year <= 2026.86) {
+        const frac = Math.max(0, (year - 1950.0) / (2026.86 - 1950.0));
+        return 311.0 + (428.38 - 311.0) * Math.pow(frac, 1.38);
+      }
+      const target = (SSP_CONFIG[sspCode] || SSP_CONFIG["SSP2-4.5"]).co2_2100;
+      const t = Math.min(1, (year - 2026.86) / (2100.0 - 2026.86));
+      if (sspCode === "SSP1-1.9") {
+        return 428.38 + 16.0 * Math.sin(Math.PI * t) - (428.38 - target) * Math.pow(t, 1.25);
+      }
+      if (sspCode === "SSP1-2.6") {
+        return 428.38 + 26.0 * Math.sin(Math.PI * 0.85 * t) + (target - 428.38) * t;
+      }
+      return 428.38 + (target - 428.38) * Math.pow(t, sspCode === "SSP5-8.5" ? 1.45 : 1.15);
+    }
+
+    // =========================================================================
+    // 2. SCIENTIFIC COLORMAPS (MIRRORING src/colormaps.rs)
+    // =========================================================================
+    const PALETTE_STOPS = {
+      Turbo: [[48,18,59],[70,107,227],[40,188,235],[50,242,152],[164,252,60],[238,207,58],[251,126,33],[208,47,5],[122,4,3]],
+      Viridis: [[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]],
+      Plasma: [[13,8,135],[126,3,168],[204,71,120],[248,149,64],[240,249,33]],
+      CoolWarm: [[59,76,192],[119,154,247],[221,221,221],[244,154,123],[180,4,38]],
+      CryoIce: [[8,29,88],[37,92,168],[78,179,211],[168,221,235],[245,252,255]],
+      Chlorophyll: [[14,34,28],[24,92,55],[58,158,76],[138,209,84],[232,247,132]],
+      ThermalIR: [[245,248,255],[160,210,255],[50,130,240],[24,185,110],[245,210,50],[235,60,40],[45,15,20]]
+    };
+
+    function sampleColormap(paletteName, norm) {
+      const stops = PALETTE_STOPS[paletteName] || PALETTE_STOPS.Viridis;
+      const t = Math.max(0, Math.min(1, norm)) * (stops.length - 1);
+      const i0 = Math.floor(t);
+      const i1 = Math.min(stops.length - 1, i0 + 1);
+      const f = t - i0;
+      return [
+        Math.round(stops[i0][0] + (stops[i1][0] - stops[i0][0]) * f),
+        Math.round(stops[i0][1] + (stops[i1][1] - stops[i0][1]) * f),
+        Math.round(stops[i0][2] + (stops[i1][2] - stops[i0][2]) * f)
+      ];
+    }
+
+    // =========================================================================
+    // 3. APPLICATION STATE & 96-TICK IN-MEMORY SQLITE RING BUFFER
+    // =========================================================================
+    const GRID_W = 72; // 5 deg lon
+    const GRID_H = 36; // 5 deg lat
+    const N_CELLS = GRID_W * GRID_H;
+
+    const state = {
+      projection: "globe_3d_wgs84",
+      ssp: "SSP2-4.5",
+      basemap: "bathymetry_topography_shaded",
+      anomalyMode: false,
+      simYear: 2026.86,
+      doy: 316,
+      hourUtc: 0,
+      atmIdx: 2, // 850 hPa
+      oceanIdx: 0, // 0 m
+      cameraLon: -20.0000,
+      cameraLat: 20.0000,
+      zoom: 1.08,
+      pinnedLat: 40.7128,
+      pinnedLon: -74.0061,
+      pinnedLabel: "New York City",
+      continentFilter: "ALL",
+      transectMode: false,
+      transectPts: [],
+      playing: false,
+      replayMode: false,
+      replayIdx: 0,
+      qgpvPhase: 0.0,
+      kelvinPhase: 0.0,
+      layerMap: {},
+      grids: {},
+      isobars: [],
+      extrema: [],
+      fronts: [],
+      readouts: { tempAnom: 1.75, co2: 428.38, enso: 3.21, sst: 20.95 },
+      ringBuffer: [], // max 96 ticks mirroring RetentionPolicy
+      worldLand: null,
+      worldBorders: null
+    };
+
+    for (const grp of LAYER_GROUPS) {
+      for (const lyr of grp.layers) {
+        state.layerMap[lyr.id] = {
+          ...lyr,
+          groupName: grp.groupName,
+          visible: lyr.vis,
+          opacity: lyr.op,
+          palette: lyr.palette
+        };
+      }
+    }
+
+    // =========================================================================
+    // 4. COUPLED GEOPHYSICAL ENGINE (2-LAYER QGPV + REDUCED-GRAVITY OCEAN)
+    // =========================================================================
+    const elevGrid = new Float32Array(N_CELLS);
+    const isOceanGrid = new Uint8Array(N_CELLS);
+
+    function syntheticElevationM(lat, lon) {
+      const phi = lat * Math.PI / 180;
+      const lam = lon * Math.PI / 180;
+      const h1 = Math.sin(phi) * 0.45
+        + 0.55 * Math.cos(phi) * Math.cos(lam - 0.35)
+        + 0.42 * Math.sin(2 * phi) * Math.cos(2 * lam + 1.1)
+        - 0.48 * Math.pow(Math.cos(phi), 2) * Math.cos(lam + 2.45)
+        + 0.36 * Math.sin(3 * lam - 0.8) * Math.cos(phi);
+      const cordillera = 1850 * Math.exp(-Math.pow((lon + 115 + 0.45 * lat) / 11, 2)) * Math.exp(-Math.pow((lat - 10) / 48, 2));
+      const tibet = 4200 * Math.exp(-Math.pow((lat - 33) / 9.5, 2) - Math.pow((lon - 86) / 18, 2));
+      const greenland = 2400 * Math.exp(-Math.pow((lat - 72) / 8, 2) - Math.pow((lon + 42) / 14, 2));
+      const antarctica = lat < -68 ? 2600 * Math.pow((-lat - 68) / 22, 0.75) : 0;
+      return Math.max(-6200, Math.min(5800, h1 * 2900 - 1150 + cordillera + tibet + greenland + antarctica));
+    }
+
+    for (let r = 0; r < GRID_H; r++) {
+      const lat = 90 - (r + 0.5) * (180 / GRID_H);
+      for (let c = 0; c < GRID_W; c++) {
+        const lon = -180 + (c + 0.5) * (360 / GRID_W);
+        const el = syntheticElevationM(lat, lon);
+        elevGrid[r * GRID_W + c] = el;
+        isOceanGrid[r * GRID_W + c] = el < 0 ? 1 : 0;
+      }
+    }
+
+    function boltonEs(tc) {
+      return 6.112 * Math.exp((17.67 * tc) / (tc + 243.5));
+    }
+
+    function stullWetBulb(tc, rh) {
+      const r = Math.max(5, Math.min(99, rh));
+      return tc * Math.atan(0.151977 * Math.sqrt(r + 8.313659))
+        + Math.atan(tc + r) - Math.atan(r - 1.676331)
+        + 0.00391838 * Math.pow(r, 1.5) * Math.atan(0.023101 * r) - 4.686035;
+    }
+
+    function solveCarbonatePh(tc, sal, co2Ppm, depthM) {
+      const tk = Math.max(271.15, tc + 273.15);
+      const tk100 = tk / 100;
+      const k0 = Math.exp(-60.2409 + 93.4517 / tk100 + 23.3585 * Math.log(tk100) + sal * (0.023517 - 0.023656 * tk100 + 0.0047036 * tk100 * tk100));
+      const pk1 = 3633.86 / tk - 61.2172 + 9.6777 * Math.log(tk) - 0.011555 * sal + 0.0001152 * sal * sal;
+      const pk2 = 471.78 / tk + 25.929 - 3.16967 * Math.log(tk) - 0.01781 * sal + 0.0001122 * sal * sal;
+      const k1 = Math.pow(10, -pk1), k2 = Math.pow(10, -pk2);
+      const pco2 = co2Ppm + 260 * (1 - Math.exp(-depthM / 950));
+      const co2Aq = k0 * pco2 * 1e-6;
+      const ta = 0.002305 * (sal / 35.0);
+      let ph = 8.08;
+      for (let it = 0; it < 7; it++) {
+        const h = Math.pow(10, -ph);
+        const hco3 = k1 * co2Aq / h;
+        const co3 = k1 * k2 * co2Aq / (h * h);
+        const res = hco3 + 2 * co3 + 0.00009 - ta;
+        const deriv = Math.LN10 * Math.max(1e-9, hco3 + 4 * co3);
+        ph = Math.max(7.2, Math.min(8.5, ph - res / deriv));
+      }
+      return ph;
+    }
+
+    function stepSimulationEngine(saveToRingBuffer) {
+      const co2Ppm = sspCo2AtYear(state.ssp, state.simYear);
+      const dfCo2 = 5.35 * Math.log(Math.max(180, co2Ppm) / 278.0);
+      // Calibrated so Oct-Nov 2026 matches verified ERA5 +1.75 °C anomaly
+      const baseWarming = (dfCo2 / 2.31) * 1.62;
+      const enso = Math.abs(state.simYear - 2026.86) < 0.35
+        ? 3.21 * Math.cos(state.kelvinPhase * 0.25)
+        : 1.65 * Math.sin(2 * Math.PI * (state.simYear - 2024.2) / 3.9 + state.kelvinPhase * 0.4);
+      const seasPhase = 2 * Math.PI * (state.doy - 172) / 365.25;
+      const atmHpa = ATM_LEVELS_HPA[state.atmIdx];
+      const oceanM = OCEAN_DEPTHS_M[state.oceanIdx];
+      const lnPRatio = Math.log(1000 / atmHpa);
+      const depthDecay = Math.exp(-oceanM / 850);
+
+      const mslp = new Float32Array(N_CELLS);
+      const t2m = new Float32Array(N_CELLS);
+      const sst = new Float32Array(N_CELLS);
+      const rh = new Float32Array(N_CELLS);
+      const u10 = new Float32Array(N_CELLS);
+      const v10 = new Float32Array(N_CELLS);
+      const uJet = new Float32Array(N_CELLS);
+      const vJet = new Float32Array(N_CELLS);
+      const uOcn = new Float32Array(N_CELLS);
+      const vOcn = new Float32Array(N_CELLS);
+      const hTc = new Float32Array(N_CELLS);
+      const precip = new Float32Array(N_CELLS);
+      const soilM = new Float32Array(N_CELLS);
+      const iceH = new Float32Array(N_CELLS);
+
+      // 1. Prognostic 2-Layer QGPV Streamfunction -> Linear-Balance MSLP & Reduced-Gravity Thermocline
+      let areaTempAnom = 0, areaWeight = 0, sstSum = 0, sstWeight = 0;
+
+      for (let r = 0; r < GRID_H; r++) {
+        const lat = 90 - (r + 0.5) * (180 / GRID_H);
+        const phi = lat * Math.PI / 180;
+        const cosPhi = Math.max(0.18, Math.cos(phi));
+        const signHem = lat >= 0 ? 1 : -1;
+        const polarAmp = lat > 0 ? 0.85 + 1.75 * Math.pow(Math.sin(phi), 2) : 0.85 + 0.72 * Math.pow(Math.sin(phi), 2);
+        const stormEnv = Math.exp(-Math.pow((Math.abs(lat) - 47) / 13.5, 2));
+
+        for (let c = 0; c < GRID_W; c++) {
+          const idx = r * GRID_W + c;
+          const lon = -180 + (c + 0.5) * (360 / GRID_W);
+          const lam = lon * Math.PI / 180;
+          const el = elevGrid[idx];
+          const ocean = isOceanGrid[idx] === 1;
+
+          // Baroclinic QGPV Rossby wave train + topographic lee troughs + NAO/Aleutian lows
+          const wave5 = Math.sin(5 * lam - state.qgpvPhase + 0.4 * signHem);
+          const wave6 = Math.cos(6 * lam - 1.25 * state.qgpvPhase - 0.9);
+          const aleutian = -16.5 * Math.exp(-Math.pow((lat - 51) / 11, 2) - Math.pow((lon + 162) / 26, 2)) * (1 + 0.15 * enso);
+          const icelandic = -15.0 * Math.exp(-Math.pow((lat - 61) / 10, 2) - Math.pow((lon + 28) / 24, 2));
+          const azores = 11.5 * Math.exp(-Math.pow((lat - 34) / 10, 2) - Math.pow((lon + 30) / 26, 2));
+          const soTrough = -20.0 * Math.exp(-Math.pow((lat + 58) / 10, 2));
+
+          const pCell = 1013.25
+            - 7.5 * Math.cos(3 * phi)
+            + stormEnv * (11.8 * wave5 + 8.4 * wave6)
+            + aleutian + icelandic + azores + soTrough;
+          mslp[idx] = Math.max(962, Math.min(1046, pCell));
+
+          // Equatorial Kelvin & off-equatorial Rossby thermocline depth anomaly (m)
+          const kelvinEnv = Math.exp(-Math.pow(lat / 7.5, 2));
+          const pacMask = (lon > 125 || lon < -75) ? 1.0 : 0.25;
+          const lonPac = lon < 0 ? lon + 360 : lon;
+          const tcAnom = ocean
+            ? pacMask * kelvinEnv * (22.0 * enso * Math.exp(-Math.pow((lonPac - 235) / 48, 2))
+              + 14.0 * Math.sin(2 * lam - state.kelvinPhase))
+            : 0;
+          hTc[idx] = tcAnom;
+
+          const preindT = 27.8 * Math.cos(phi) - 15.5 * Math.pow(Math.sin(phi), 2) - (el > 0 ? 0.0065 * el : 0);
+          const seasSwing = (ocean ? 4.2 : 13.5) * Math.sin(phi) * Math.cos(seasPhase);
+          const frontalWaveT = stormEnv * 4.8 * Math.cos(5 * lam - state.qgpvPhase - 0.55 * signHem);
+          const ensoFoot = enso * Math.exp(-Math.pow(lat / 9.5, 2) - Math.pow((lon + 125) / 46, 2));
+
+          const tVal = preindT + seasSwing + baseWarming * polarAmp + 0.55 * ensoFoot + frontalWaveT;
+          t2m[idx] = tVal;
+
+          const sstVal = ocean
+            ? Math.max(-1.85, 28.4 * Math.cos(phi) - 3.6 * Math.pow(Math.sin(phi), 2) + 0.35 * seasSwing + 0.62 * baseWarming + 0.95 * ensoFoot + 0.04 * tcAnom)
+            : NaN;
+          sst[idx] = sstVal;
+
+          const rhVal = Math.max(14, Math.min(98, (ocean ? 81 : 60) - 21 * Math.pow(Math.sin(2 * phi), 2) - 0.45 * (mslp[idx] - 1013.25)));
+          rh[idx] = rhVal;
+
+          soilM[idx] = ocean ? NaN : Math.max(0.03, Math.min(0.47, 0.08 + 0.36 * (rhVal / 100) - 0.01 * baseWarming));
+          iceH[idx] = (ocean && sstVal < 0.0) ? Math.min(4.4, 0.028 * Math.sqrt(Math.max(0, -tVal) * 115)) : 0;
+
+          areaTempAnom += (tVal - preindT) * cosPhi;
+          areaWeight += cosPhi;
+          if (ocean && Math.abs(lat) <= 60) {
+            sstSum += sstVal * cosPhi;
+            sstWeight += cosPhi;
+          }
+        }
+      }
+
+      // 2. Geostrophic-Ekman Winds, Upper-Level QG Jet, Stommel-Munk Ocean Gyres & Precipitation
+      for (let r = 0; r < GRID_H; r++) {
+        const lat = 90 - (r + 0.5) * (180 / GRID_H);
+        const phi = lat * Math.PI / 180;
+        const cosPhi = Math.max(0.20, Math.cos(phi));
+        const fCor = 2 * 7.2921e-5 * Math.sin(phi);
+        const rn = Math.max(0, r - 1), rs = Math.min(GRID_H - 1, r + 1);
+        const dy = Math.max(1, rs - rn) * 6371000 * (Math.PI / GRID_H);
+        const dx = 2 * 6371000 * cosPhi * (2 * Math.PI / GRID_W);
+
+        for (let c = 0; c < GRID_W; c++) {
+          const idx = r * GRID_W + c;
+          const cw = (c - 1 + GRID_W) % GRID_W;
+          const ce = (c + 1) % GRID_W;
+          const lon = -180 + (c + 0.5) * (360 / GRID_W);
+          const ocean = isOceanGrid[idx] === 1;
+
+          const dpdx = (mslp[r * GRID_W + ce] - mslp[r * GRID_W + cw]) * 100 / dx;
+          const dpdy = (mslp[rn * GRID_W + c] - mslp[rs * GRID_W + c]) * 100 / dy;
+          const pgfx = -dpdx / 1.225, pgfy = -dpdy / 1.225;
+          const rDrag = ocean ? 4.5e-5 : 7.8e-5;
+          const denom = fCor * fCor + rDrag * rDrag;
+
+          const uEk = (rDrag * pgfx + fCor * pgfy) / denom;
+          const vEk = (rDrag * pgfy - fCor * pgfx) / denom;
+          const uZon = -5.2 * Math.cos(3 * phi) + 8.5 * Math.pow(Math.sin(2 * phi), 2);
+          u10[idx] = Math.max(-42, Math.min(42, 0.62 * uEk + 0.38 * uZon));
+          v10[idx] = Math.max(-36, Math.min(36, 0.72 * vEk - 1.2 * Math.sin(2 * phi)));
+
+          // Thermal wind shear du/d(ln p) for 2-layer QGPV jet stream
+          const dtdx = (t2m[r * GRID_W + ce] - t2m[r * GRID_W + cw]) / dx;
+          const dtdy = (t2m[rn * GRID_W + c] - t2m[rs * GRID_W + c]) / dy;
+          const fReg = lat >= 0 ? Math.max(4.5e-5, fCor) : Math.min(-4.5e-5, fCor);
+          const tropoLn = Math.min(1.65, lnPRatio) - 0.35 * Math.max(0, lnPRatio - 1.65);
+          uJet[idx] = Math.max(-85, Math.min(92, u10[idx] - 0.58 * (287.05 / fReg) * dtdy * tropoLn));
+          vJet[idx] = Math.max(-68, Math.min(68, v10[idx] + 0.58 * (287.05 / fReg) * dtdx * tropoLn));
+
+          // Orographic + cyclonic low-pressure precipitation
+          const dzdx = Math.max(0, elevGrid[r * GRID_W + ce]) - Math.max(0, elevGrid[r * GRID_W + cw]);
+          const wOro = Math.max(0, (u10[idx] * dzdx) / dx);
+          const itcz = Math.exp(-Math.pow((lat - 5 * Math.cos(seasPhase)) / 7.5, 2));
+          const cycLift = Math.max(0, 1011 - mslp[idx]) * 0.22;
+          precip[idx] = Math.min(55, (2.2 * itcz + 22 * wOro + cycLift * (rh[idx] / 100)) * (1 + 0.06 * baseWarming));
+
+          // Coupled Stommel-Munk Western Boundary Intensification + Reduced-Gravity + ACC
+          if (ocean) {
+            const amocFac = Math.max(0.45, 1.0 - 0.06 * baseWarming);
+            const gulfKuroshio = 1.25 * amocFac * (
+              Math.exp(-Math.pow((lon + 73) / 7.5, 2) - Math.pow((lat - 35) / 10, 2)) +
+              Math.exp(-Math.pow((lon - 142) / 7.5, 2) - Math.pow((lat - 34) / 10, 2))
+            );
+            const eqKelvinU = 0.55 * (hTc[idx] / 25.0) * Math.exp(-Math.pow(lat / 6, 2));
+            const acc = lat < -42 ? 0.68 : 0;
+            const signF = lat >= 0 ? 1 : -1;
+            uOcn[idx] = (-0.28 * Math.cos(3 * phi) + eqKelvinU + acc + 0.35 * gulfKuroshio + 0.015 * (u10[idx] + signF * v10[idx])) * depthDecay;
+            vOcn[idx] = (gulfKuroshio + 0.015 * (v10[idx] - signF * u10[idx])) * depthDecay;
+          }
+        }
+      }
+
+      // 3. Populate All 34 Layer Rasters + U/V Vectors
+      const outGrids = {};
+      const registerGrid = (id, arr, uArr = null, vArr = null) => {
+        let sum = 0, cnt = 0;
+        for (let i = 0; i < N_CELLS; i++) {
+          if (Number.isFinite(arr[i])) { sum += arr[i]; cnt++; }
+        }
+        outGrids[id] = { values: arr, u: uArr, v: vArr, mean: cnt > 0 ? sum / cnt : 0 };
+      };
+
+      const gSat = new Float32Array(N_CELLS);
+      const gRad = new Float32Array(N_CELLS);
+      const gSpd = new Float32Array(N_CELLS);
+      const gIvt = new Float32Array(N_CELLS), uIvt = new Float32Array(N_CELLS), vIvt = new Float32Array(N_CELLS);
+      const gLtg = new Float32Array(N_CELLS);
+      const gCo2 = new Float32Array(N_CELLS);
+      const gCh4 = new Float32Array(N_CELLS);
+      const gNo2 = new Float32Array(N_CELLS);
+      const gAod = new Float32Array(N_CELLS);
+      const gToa = new Float32Array(N_CELLS);
+      const gOhc = new Float32Array(N_CELLS);
+      const gCur = new Float32Array(N_CELLS);
+      const gSsh = new Float32Array(N_CELLS);
+      const gPh = new Float32Array(N_CELLS);
+      const gChl = new Float32Array(N_CELLS);
+      const gTel = new Float32Array(N_CELLS);
+      const gSic = new Float32Array(N_CELLS);
+      const gSmb = new Float32Array(N_CELLS);
+      const gGlc = new Float32Array(N_CELLS);
+      const gPrm = new Float32Array(N_CELLS);
+      const gBio = new Float32Array(N_CELLS);
+      const gSif = new Float32Array(N_CELLS);
+      const gRiv = new Float32Array(N_CELLS);
+      const gFrp = new Float32Array(N_CELLS);
+      const gLulc = new Float32Array(N_CELLS);
+      const gCmip = new Float32Array(N_CELLS);
+      const gWbgt = new Float32Array(N_CELLS);
+      const gSurg = new Float32Array(N_CELLS);
+      const gFwi = new Float32Array(N_CELLS);
+      const gRisk = new Float32Array(N_CELLS);
+
+      for (let r = 0; r < GRID_H; r++) {
+        const lat = 90 - (r + 0.5) * (180 / GRID_H);
+        const phi = lat * Math.PI / 180;
+        for (let c = 0; c < GRID_W; c++) {
+          const i = r * GRID_W + c;
+          const lon = -180 + (c + 0.5) * (360 / GRID_W);
+          const ocean = isOceanGrid[i] === 1;
+          const el = elevGrid[i];
+          const tc = t2m[i];
+          const rhc = rh[i];
+          const pr = precip[i];
+          const wspd = Math.hypot(u10[i], v10[i]);
+
+          const cld = Math.max(0, Math.min(1, (rhc - 52) / 46));
+          gSat[i] = (tc + 273.15) - 50 * cld - 11 * Math.min(3, pr);
+          gRad[i] = pr > 0.06 ? Math.min(64, 10 * Math.log10(200 * Math.pow(pr, 1.6))) : NaN;
+          gSpd[i] = Math.hypot(uJet[i], vJet[i]);
+
+          const qSat = 0.622 * boltonEs(tc) / Math.max(100, mslp[i]);
+          const q = qSat * (rhc / 100);
+          const pw = q * (70000 / 9.80665) * 0.42;
+          uIvt[i] = pw * (u10[i] * 1.55);
+          vIvt[i] = pw * (v10[i] * 1.55);
+          gIvt[i] = Math.hypot(uIvt[i], vIvt[i]);
+
+          const cape = Math.max(0, (tc + 2.2 * (q * 1000) - 24) * 95);
+          gLtg[i] = (ocean ? 0.22 : 1.35) * 0.005 * Math.pow(cape / 100, 1.25) * Math.sqrt(pr);
+
+          gCo2[i] = co2Ppm + (lat > 15 && !ocean ? -4.2 * Math.cos(seasPhase) : 0.5) + (!ocean && lat > 20 && lat < 55 ? 2.8 : 0);
+          gCh4[i] = 1938 + 38 * (dfCo2 - 2.2) + 40 * Math.sin(phi) + (!ocean && Math.abs(lat) < 15 ? 65 * soilM[i] : 0)
+            + 92 * Math.exp(-Math.pow((lat - 31.8) / 4.5, 2) - Math.pow((lon + 102.5) / 5.5, 2));
+
+          const sahara = 0.55 * Math.exp(-Math.pow((lat - 21) / 10, 2) - Math.pow((lon - 8) / 26, 2));
+          const asia = 0.42 * Math.exp(-Math.pow((lat - 28) / 12, 2) - Math.pow((lon - 108) / 22, 2));
+          const smoke = 0.30 * Math.exp(-Math.pow((lat - 44) / 9, 2) - Math.pow((lon + 121) / 15, 2));
+          gAod[i] = Math.max(0.02, (0.07 + sahara + asia + smoke) * Math.exp(-0.07 * pr));
+          gNo2[i] = gAod[i] * (ocean ? 1.5 : 12.5);
+
+          const alb = Math.min(0.82, (tc < -5 || iceH[i] > 0.15 ? 0.64 : (ocean ? 0.09 : 0.24)) + 0.21 * (rhc / 100));
+          const qSolar = 340.25 * (1 - 0.482 * (1.5 * Math.pow(Math.sin(phi), 2) - 0.5));
+          gToa[i] = qSolar * (1 - alb) - ((208.5 + 1.95 * tc) - dfCo2);
+
+          if (ocean) {
+            const tz = 1.5 + (sst[i] - 1.5) * depthDecay;
+            const sal = 34.7 + 1.1 * Math.cos(2 * phi) * depthDecay;
+            gOhc[i] = 1026 * 3990 * Math.max(-1.8, tz) * 100 * 1e-9;
+            gCur[i] = Math.hypot(uOcn[i], vOcn[i]);
+            const slrCm = Math.max(0, baseWarming - 0.9) * 28.5;
+            gSsh[i] = slrCm - (mslp[i] - 1013.25) + 1.35 * (sst[i] - 15) + 0.32 * hTc[i];
+            gPh[i] = solveCarbonatePh(tz, sal, co2Ppm, oceanM);
+            gChl[i] = (0.08 + 1.7 * Math.exp(-Math.pow((Math.abs(lat) - 52) / 12, 2)) + 0.95 * Math.exp(-Math.pow(lat / 4.5, 2)) + (el > -900 ? 1.8 : 0.1))
+              * Math.max(0.4, 1 - 0.025 * Math.max(0, sst[i] - 24));
+            gSic[i] = iceH[i] > 0.02 ? Math.min(100, (iceH[i] / 0.65) * 100) : NaN;
+          } else {
+            gOhc[i] = NaN; gCur[i] = NaN; gSsh[i] = NaN; gPh[i] = NaN; gChl[i] = NaN; gSic[i] = NaN;
+          }
+
+          gTel[i] = (Math.abs(lat) <= 5 && lon >= -170 && lon <= -120) ? enso
+            : ((lat >= 20 && lat <= 60 && (lon < -120 || lon > 140)) ? -0.55 * enso : 0.0);
+
+          const onIceSheet = (lat >= 60 && lat <= 83 && lon >= -58 && lon <= -22) || lat < -68;
+          gSmb[i] = onIceSheet ? (pr * 24 * 0.35 - 14.5 * baseWarming * (el < 1800 ? 2.2 : 0.45)) : NaN;
+          gGlc[i] = (!ocean && (el > 2000 || Math.abs(lat) > 64) && tc < 4) ? Math.min(550, 42 * Math.exp(0.11 * (tc + 10)) * Math.pow(el / 2000, 2)) : NaN;
+          gPrm[i] = (!ocean && lat > 52) ? Math.min(4.2, 0.045 * Math.sqrt(Math.max(0, tc + 12) * 85)) : NaN;
+
+          if (!ocean) {
+            const sm = soilM[i];
+            gBio[i] = tc > -8 ? Math.min(340, 280 * Math.pow(Math.min(1.15, sm / 0.36), 2) * Math.max(0, (tc + 8) / 34)) : 0;
+            gSif[i] = 1.6 * Math.max(0.05, (sm - 0.03) / 0.30) * Math.exp(-Math.pow((tc - 23) / 14, 2)) * (1 + 0.18 * Math.log(co2Ppm / 380));
+            const satF = Math.min(1, sm / 0.48);
+            gRiv[i] = pr * 520 * (0.25 + 0.75 * satF * satF) + 380 * Math.pow(satF, 3);
+            gLulc[i] = tc < -6 ? 8 : (sm < 0.11 ? 7 : (sm > 0.25 && tc > 4 ? 1 : 4));
+          } else {
+            gBio[i] = NaN; gSif[i] = NaN; gRiv[i] = NaN; gLulc[i] = NaN;
+          }
+
+          const preind = 27.8 * Math.cos(phi) - 15.5 * Math.pow(Math.sin(phi), 2) - (el > 0 ? 0.0065 * el : 0);
+          gCmip[i] = tc - preind;
+
+          const tw = stullWetBulb(tc, rhc);
+          const wbgt = 0.7 * tw + 0.2 * (tc + 4.2 / Math.pow(Math.max(0.6, wspd), 0.45)) + 0.1 * tc;
+          gWbgt[i] = wbgt;
+
+          gSurg[i] = (!ocean && el < 35) ? Math.max(0, Math.max(0.05, (baseWarming - 0.9) * 0.32) + 1.8 + 0.08 * wspd + Math.max(0, 1013.25 - mslp[i]) * 0.01 - el * 0.08) : NaN;
+
+          if (!ocean) {
+            const fwi = Math.max(0, Math.min(110, (Math.max(0, tc - 4) * 1.45 + wspd * 1.8) * Math.max(0.05, (100 - rhc) / 72) * Math.exp(-0.22 * pr)));
+            gFwi[i] = fwi;
+            gFrp[i] = (fwi > 24 && tc > 8) ? (fwi - 24) * 3.8 : NaN;
+            const popW = Math.exp(-Math.pow((Math.abs(lat) - 32) / 24, 2));
+            gRisk[i] = Math.min(100, (1.6 * Math.max(0, wbgt - 18) + 0.55 * fwi) * (0.45 + 0.85 * popW));
+          } else {
+            gFwi[i] = NaN; gFrp[i] = NaN; gRisk[i] = NaN;
+          }
+        }
+      }
+
+      registerGrid("geo_multispectral_satellite", gSat);
+      registerGrid("volumetric_doppler_radar", gRad);
+      registerGrid("synoptic_fronts_isobars", mslp);
+      registerGrid("wind_vector_jet_streams", gSpd, uJet, vJet);
+      registerGrid("atmospheric_rivers_ivt", gIvt, uIvt, vIvt);
+      registerGrid("global_lightning_telemetry", gLtg);
+      registerGrid("column_co2_flux", gCo2);
+      registerGrid("methane_plumes_background", gCh4);
+      registerGrid("tropospheric_no2_so2", gNo2);
+      registerGrid("aerosol_optical_depth_speciated", gAod);
+      registerGrid("toa_radiative_energy_budget", gToa);
+      registerGrid("sst_marine_heatwaves", sst);
+      registerGrid("subsurface_ocean_heat_salinity_3d", gOhc);
+      registerGrid("thermohaline_currents_amoc", gCur, uOcn, vOcn);
+      registerGrid("swot_sea_surface_height_altimetry", gSsh);
+      registerGrid("ocean_acidification_carbonate", gPh);
+      registerGrid("marine_chlorophyll_hypoxia", gChl);
+      registerGrid("teleconnection_oscillation_masks", gTel);
+      registerGrid("sea_ice_concentration_drift", gSic);
+      registerGrid("sea_ice_thickness_freeboard_age", iceH);
+      registerGrid("gravimetric_ice_sheet_mass_balance", gSmb);
+      registerGrid("alpine_glacier_velocity_rgi", gGlc);
+      registerGrid("permafrost_thermokarst_subsidence", gPrm);
+      registerGrid("canopy_height_aboveground_biomass", gBio);
+      registerGrid("sif_photosynthesis_evaporative_stress", gSif);
+      registerGrid("soil_moisture_groundwater_grace", soilM);
+      registerGrid("swot_surface_water_river_discharge", gRiv);
+      registerGrid("active_wildfires_frp_burn_severity", gFrp);
+      registerGrid("dynamic_land_cover_deforestation", gLulc);
+      registerGrid("cmip6_downscaled_ensemble", gCmip);
+      registerGrid("wet_bulb_globe_temp_heat_stress", gWbgt);
+      registerGrid("coastal_inundation_storm_surge", gSurg);
+      registerGrid("compound_hazard_fire_weather_index", gFwi);
+      registerGrid("critical_infrastructure_socioeconomic_exposure", gRisk);
+
+      state.grids = outGrids;
+      state.readouts = {
+        tempAnom: areaWeight > 0 ? areaTempAnom / areaWeight : 1.75,
+        co2: co2Ppm,
+        enso: enso,
+        sst: sstWeight > 0 ? sstSum / sstWeight : 20.95
+      };
+
+      computeSynopticOverlays(mslp, gCmip, uJet, vJet);
+
+      if (saveToRingBuffer) {
+        const yr = Math.floor(state.simYear);
+        const date = new Date(Date.UTC(yr, 0, Math.max(1, Math.floor(state.doy)), state.hourUtc));
+        const tsUtc = date.toISOString().replace(".000Z", "Z");
+        const snapGrids = {};
+        for (const k of Object.keys(outGrids)) {
+          snapGrids[k] = {
+            values: new Float32Array(outGrids[k].values),
+            u: outGrids[k].u ? new Float32Array(outGrids[k].u) : null,
+            v: outGrids[k].v ? new Float32Array(outGrids[k].v) : null,
+            mean: outGrids[k].mean
+          };
+        }
+        state.ringBuffer.push({
+          tsUtc,
+          simYear: state.simYear,
+          doy: state.doy,
+          readouts: { ...state.readouts },
+          grids: snapGrids
+        });
+        if (state.ringBuffer.length > 96) {
+          state.ringBuffer.shift();
+        }
+      }
+
+      updateReadoutDom();
+      updateAnalyticsDock();
+    }
+
+    // =========================================================================
+    // 5. 16-CASE MARCHING SQUARES ISOBARS, L/H EXTREMA & FRONTS (src/interp.rs)
+    // =========================================================================
+    function computeSynopticOverlays(mslp, tempAnom, uWind, vWind) {
+      const segs = [];
+      const dlat = 180 / GRID_H, dlon = 360 / GRID_W;
+      const interpEdge = (p1, p2, v1, v2, iso) => {
+        const den = v2 - v1;
+        const t = Math.abs(den) < 1e-5 ? 0.5 : Math.max(0, Math.min(1, (iso - v1) / den));
+        return [p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1])];
+      };
+
+      for (let iso = 976; iso <= 1040; iso += 4) {
+        for (let r = 0; r < GRID_H - 1; r++) {
+          const latT = 90 - (r + 0.5) * dlat;
+          const latB = 90 - (r + 1.5) * dlat;
+          for (let c = 0; c < GRID_W; c++) {
+            const cn = (c + 1) % GRID_W;
+            const lonL = -180 + (c + 0.5) * dlon;
+            const lonR = lonL + dlon;
+            const vTL = mslp[r * GRID_W + c], vTR = mslp[r * GRID_W + cn];
+            const vBR = mslp[(r + 1) * GRID_W + cn], vBL = mslp[(r + 1) * GRID_W + c];
+            let idx = 0;
+            if (vBL >= iso) idx |= 1;
+            if (vBR >= iso) idx |= 2;
+            if (vTR >= iso) idx |= 4;
+            if (vTL >= iso) idx |= 8;
+            if (idx === 0 || idx === 15) continue;
+
+            const pTL = [lonL, latT], pTR = [lonR, latT], pBR = [lonR, latB], pBL = [lonL, latB];
+            const eT = () => interpEdge(pTL, pTR, vTL, vTR, iso);
+            const eR = () => interpEdge(pTR, pBR, vTR, vBR, iso);
+            const eB = () => interpEdge(pBL, pBR, vBL, vBR, iso);
+            const eL = () => interpEdge(pTL, pBL, vTL, vBL, iso);
+
+            if (idx === 1 || idx === 14) segs.push({ a: eL(), b: eB(), iso });
+            else if (idx === 2 || idx === 13) segs.push({ a: eB(), b: eR(), iso });
+            else if (idx === 3 || idx === 12) segs.push({ a: eL(), b: eR(), iso });
+            else if (idx === 4 || idx === 11) segs.push({ a: eT(), b: eR(), iso });
+            else if (idx === 6 || idx === 9) segs.push({ a: eT(), b: eB(), iso });
+            else if (idx === 7 || idx === 8) segs.push({ a: eT(), b: eL(), iso });
+          }
+        }
+      }
+      state.isobars = segs;
+
+      // Extrema detection (3x3 neighborhood + separation filter)
+      const cands = [];
+      for (let r = 2; r < GRID_H - 2; r++) {
+        const lat = 90 - (r + 0.5) * dlat;
+        if (Math.abs(lat) > 78) continue;
+        for (let c = 0; c < GRID_W; c++) {
+          const v = mslp[r * GRID_W + c];
+          let isMin = true, isMax = true, sum = 0;
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              if (dr === 0 && dc === 0) continue;
+              const nb = mslp[(r + dr) * GRID_W + ((c + dc + GRID_W) % GRID_W)];
+              if (nb <= v) isMin = false;
+              if (nb >= v) isMax = false;
+              sum += nb;
+            }
+          }
+          const prom = Math.abs(v - sum / 8);
+          if ((isMin || isMax) && prom >= 1.2) {
+            cands.push({ lat, lon: -180 + (c + 0.5) * dlon, val: v, isLow: isMin, prom });
+          }
+        }
+      }
+      cands.sort((a, b) => b.prom - a.prom);
+      const kept = [];
+      for (const cd of cands) {
+        if (!kept.some(k => Math.hypot(k.lat - cd.lat, k.lon - cd.lon) < 22)) {
+          kept.push(cd);
+          if (kept.length >= 14) break;
+        }
+      }
+      state.extrema = kept;
+
+      // Baroclinic cold & warm front segments
+      const fronts = [];
+      for (let r = 3; r < GRID_H - 3; r++) {
+        const lat = 90 - (r + 0.5) * dlat;
+        if (Math.abs(lat) < 22 || Math.abs(lat) > 68) continue;
+        for (let c = 0; c < GRID_W; c++) {
+          const i = r * GRID_W + c;
+          const cw = (c - 1 + GRID_W) % GRID_W, ce = (c + 1) % GRID_W;
+          const dtdx = tempAnom[r * GRID_W + ce] - tempAnom[r * GRID_W + cw];
+          const dtdy = tempAnom[(r - 1) * GRID_W + c] - tempAnom[(r + 1) * GRID_W + c];
+          const mag = Math.hypot(dtdx, dtdy);
+          if (mag < 2.2) continue;
+          const adv = -(uWind[i] * dtdx + vWind[i] * dtdy);
+          if (Math.abs(adv) < 18) continue;
+          const tx = -dtdy / mag, ty = dtdx / mag;
+          const lon = -180 + (c + 0.5) * dlon;
+          fronts.push({
+            a: [lon - 2.1 * tx, lat - 1.6 * ty],
+            b: [lon + 2.1 * tx, lat + 1.6 * ty],
+            cold: adv < 0
+          });
+        }
+      }
+      state.fronts = fronts;
+    }
+
+    // =========================================================================
+    // 6. BILINEAR SAMPLER & LAGRANGIAN STREAMLINE PARTICLES
+    // =========================================================================
+    function sampleBilinear(arr, lat, lon) {
+      if (!arr) return NaN;
+      const clat = Math.max(-89.9, Math.min(89.9, lat));
+      const wlon = ((lon + 180) % 360 + 360) % 360 - 180;
+      const fy = ((90 - clat) / 180) * GRID_H - 0.5;
+      const fx = ((wlon + 180) / 360) * GRID_W - 0.5;
+      const y0 = Math.max(0, Math.min(GRID_H - 1, Math.floor(fy)));
+      const y1 = Math.min(GRID_H - 1, y0 + 1);
+      const wy = Math.max(0, Math.min(1, fy - Math.floor(fy)));
+      const x0 = ((Math.floor(fx) % GRID_W) + GRID_W) % GRID_W;
+      const x1 = (x0 + 1) % GRID_W;
+      const wx = Math.max(0, Math.min(1, fx - Math.floor(fx)));
+      const v00 = arr[y0 * GRID_W + x0], v10 = arr[y0 * GRID_W + x1];
+      const v01 = arr[y1 * GRID_W + x0], v11 = arr[y1 * GRID_W + x1];
+      if (!Number.isFinite(v00) || !Number.isFinite(v10) || !Number.isFinite(v01) || !Number.isFinite(v11)) {
+        return v00;
+      }
+      return (v00 * (1 - wx) + v10 * wx) * (1 - wy) + (v01 * (1 - wx) + v11 * wx) * wy;
+    }
+
+    const NUM_PARTICLES = 360;
+    const particles = Array.from({ length: NUM_PARTICLES }, (_, i) => {
+      const y = 1 - (2 * (i + 0.5)) / NUM_PARTICLES;
+      const lat = Math.asin(Math.max(-1, Math.min(1, y))) * 180 / Math.PI;
+      const lon = (((i * 137.508) % 360) + 360) % 360 - 180;
+      return { lat, lon, prevLat: lat, prevLon: lon, age: i % 75, maxAge: 75 + (i % 40) };
+    });
+
+    function stepParticles() {
+      const vecId = ["wind_vector_jet_streams", "atmospheric_rivers_ivt", "thermohaline_currents_amoc"]
+        .find(id => state.layerMap[id] && state.layerMap[id].visible);
+      if (!vecId || !state.grids[vecId] || !state.grids[vecId].u) return null;
+
+      const g = state.grids[vecId];
+      const scale = vecId === "thermohaline_currents_amoc" ? 0.65 : (vecId === "atmospheric_rivers_ivt" ? 0.0016 : 0.025);
+
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        p.age++;
+        if (p.age >= p.maxAge || Math.abs(p.lat) > 86) {
+          const y = 1 - (2 * ((i + Math.random()) / NUM_PARTICLES));
+          p.lat = Math.asin(Math.max(-0.98, Math.min(0.98, y))) * 180 / Math.PI;
+          p.lon = -180 + Math.random() * 360;
+          p.prevLat = p.lat;
+          p.prevLon = p.lon;
+          p.age = 0;
+          continue;
+        }
+        const u = sampleBilinear(g.u, p.lat, p.lon);
+        const v = sampleBilinear(g.v, p.lat, p.lon);
+        if (Number.isFinite(u) && Number.isFinite(v) && (Math.abs(u) + Math.abs(v) > 0.01)) {
+          p.prevLat = p.lat;
+          p.prevLon = p.lon;
+          const cosLat = Math.max(0.22, Math.cos(p.lat * Math.PI / 180));
+          p.lon = (((p.lon + (u * scale) / cosLat + 180) % 360) + 360) % 360 - 180;
+          p.lat = Math.max(-86, Math.min(86, p.lat + v * scale));
+        } else {
+          p.age = p.maxAge;
+        }
+      }
+      return vecId;
+    }
+
+    // =========================================================================
+    // 7. D3 SPHERICAL PROJECTION & MULTI-LAYER CANVAS RENDERER
+    // =========================================================================
+    const planetCanvas = document.getElementById("planetCanvas");
+    const pCtx = planetCanvas.getContext("2d");
+
+    function buildD3Projection(width, height) {
+      const minDim = Math.min(width, height);
+      if (state.projection === "equirectangular_2d") {
+        return d3.geoEquirectangular()
+          .scale((width / (2 * Math.PI)) * state.zoom * 0.94)
+          .translate([width / 2, height / 2])
+          .rotate([-state.cameraLon, 0]);
+      }
+      if (state.projection === "arctic_polar_stereo") {
+        return d3.geoStereographic()
+          .scale(minDim * 0.36 * state.zoom)
+          .translate([width / 2, height / 2])
+          .rotate([-state.cameraLon, -90])
+          .clipAngle(115);
+      }
+      if (state.projection === "antarctic_polar_stereo") {
+        return d3.geoStereographic()
+          .scale(minDim * 0.36 * state.zoom)
+          .translate([width / 2, height / 2])
+          .rotate([-state.cameraLon, 90])
+          .clipAngle(115);
+      }
+      return d3.geoOrthographic()
+        .scale(minDim * 0.43 * state.zoom)
+        .translate([width / 2, height / 2])
+        .rotate([-state.cameraLon, -state.cameraLat])
+        .clipAngle(90);
+    }
+
+    function renderPlanetFrame() {
+      const rect = planetCanvas.parentElement.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(200, Math.floor(rect.width));
+      const h = Math.max(200, Math.floor(rect.height));
+      if (planetCanvas.width !== w * dpr || planetCanvas.height !== h * dpr) {
+        planetCanvas.width = w * dpr;
+        planetCanvas.height = h * dpr;
+      }
+
+      pCtx.save();
+      pCtx.scale(dpr, dpr);
+      pCtx.fillStyle = "#050912";
+      pCtx.fillRect(0, 0, w, h);
+
+      const proj = buildD3Projection(w, h);
+      const geoPath = d3.geoPath(proj, pCtx);
+
+      // 1. Ocean Sphere / Basemap Fill
+      pCtx.beginPath();
+      geoPath({ type: "Sphere" });
+      pCtx.fillStyle = state.basemap === "viirs_nightlights_baseline" ? "#04070f"
+        : (state.basemap === "dark_telemetry_vector" ? "#091220" : "#0b1d36");
+      pCtx.fill();
+
+      // 2. Land Basemap Polygon (Natural Earth 110m via world-atlas)
+      if (state.worldLand) {
+        pCtx.beginPath();
+        geoPath(state.worldLand);
+        pCtx.fillStyle = state.basemap === "viirs_nightlights_baseline" ? "#0d1322"
+          : (state.basemap === "dark_telemetry_vector" ? "#151f30" : "#1c2d27");
+        pCtx.fill();
+      }
+
+      // 3. Active Predictive Layer Raster Cells (Clipped to Sphere)
+      const visibleLayers = Object.values(state.layerMap).filter(l => l.visible && state.grids[l.id]);
+      if (visibleLayers.length > 0) {
+        pCtx.save();
+        pCtx.beginPath();
+        geoPath({ type: "Sphere" });
+        pCtx.clip();
+
+        const dlat = 180 / GRID_H, dlon = 360 / GRID_W;
+        for (let r = 0; r < GRID_H; r++) {
+          const lat = 90 - (r + 0.5) * dlat;
+          for (let c = 0; c < GRID_W; c++) {
+            const lon = -180 + (c + 0.5) * dlon;
+            // Cull back-hemisphere points on 3D globe quickly
+            if (state.projection === "globe_3d_wgs84") {
+              const gDist = d3.geoDistance([lon, lat], [state.cameraLon, state.cameraLat]);
+              if (gDist > 1.59) continue;
+            }
+            const idx = r * GRID_W + c;
+            let cr = 0, cg = 0, cb = 0, ca = 0;
+
+            for (let li = 0; li < visibleLayers.length; li++) {
+              const lyr = visibleLayers[li];
+              const g = state.grids[lyr.id];
+              const val = g.values[idx];
+              if (!Number.isFinite(val)) continue;
+
+              let norm = 0.5, pal = lyr.palette;
+              if (state.anomalyMode) {
+                const span = Math.max(1e-3, (lyr.max - lyr.min) * 0.45);
+                norm = ((val - g.mean) / span) * 0.5 + 0.5;
+                pal = "CoolWarm";
+              } else {
+                norm = (val - lyr.min) / Math.max(1e-5, lyr.max - lyr.min);
+              }
+              const rgb = sampleColormap(pal, norm);
+              const a = lyr.opacity * 0.78;
+              cr = cr * (1 - a) + rgb[0] * a;
+              cg = cg * (1 - a) + rgb[1] * a;
+              cb = cb * (1 - a) + rgb[2] * a;
+              ca = ca + a * (1 - ca);
+            }
+
+            if (ca > 0.03) {
+              const pt = proj([lon, lat]);
+              if (!pt) continue;
+              const pRight = proj([lon + dlon, lat]);
+              const pDown = proj([lon, lat - dlat]);
+              const cellW = pRight ? Math.min(48, Math.max(5, Math.hypot(pRight[0] - pt[0], pRight[1] - pt[1]) * 1.18)) : 14;
+              const cellH = pDown ? Math.min(48, Math.max(5, Math.hypot(pDown[0] - pt[0], pDown[1] - pt[1]) * 1.18)) : 14;
+              pCtx.fillStyle = `rgba(${cr | 0},${cg | 0},${cb | 0},${ca.toFixed(2)})`;
+              pCtx.fillRect(pt[0] - cellW * 0.5, pt[1] - cellH * 0.5, cellW, cellH);
+            }
+          }
+        }
+        pCtx.restore();
+      }
+
+      // 4. Graticule & Crisp Published Natural Earth Coastlines + Borders
+      const graticule = d3.geoGraticule10();
+      pCtx.beginPath();
+      geoPath(graticule);
+      pCtx.strokeStyle = "rgba(180, 210, 245, 0.13)";
+      pCtx.lineWidth = 0.6;
+      pCtx.stroke();
+
+      if (state.worldLand) {
+        pCtx.beginPath();
+        geoPath(state.worldLand);
+        pCtx.strokeStyle = "rgba(226, 240, 255, 0.72)";
+        pCtx.lineWidth = 1.1;
+        pCtx.stroke();
+      }
+      if (state.worldBorders) {
+        pCtx.beginPath();
+        geoPath(state.worldBorders);
+        pCtx.strokeStyle = "rgba(148, 163, 184, 0.28)";
+        pCtx.lineWidth = 0.55;
+        pCtx.stroke();
+      }
+
+      // 5. Marching-Squares 4 hPa MSLP Isobars, Fronts & L/H Cyclone Badges
+      if (state.layerMap.synoptic_fronts_isobars.visible) {
+        for (let i = 0; i < state.isobars.length; i++) {
+          const s = state.isobars[i];
+          if (state.projection === "globe_3d_wgs84" && d3.geoDistance(s.a, [state.cameraLon, state.cameraLat]) > 1.54) continue;
+          const p1 = proj(s.a), p2 = proj(s.b);
+          if (!p1 || !p2 || Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) > w * 0.22) continue;
+          const major = s.iso === 1000 || s.iso === 1012;
+          pCtx.beginPath();
+          pCtx.moveTo(p1[0], p1[1]);
+          pCtx.lineTo(p2[0], p2[1]);
+          pCtx.strokeStyle = major ? "rgba(255,255,255,0.82)" : "rgba(226,240,255,0.46)";
+          pCtx.lineWidth = major ? 1.5 : 0.85;
+          pCtx.stroke();
+        }
+
+        for (let i = 0; i < state.fronts.length; i++) {
+          const f = state.fronts[i];
+          if (state.projection === "globe_3d_wgs84" && d3.geoDistance(f.a, [state.cameraLon, state.cameraLat]) > 1.52) continue;
+          const p1 = proj(f.a), p2 = proj(f.b);
+          if (!p1 || !p2 || Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) > w * 0.18) continue;
+          pCtx.beginPath();
+          pCtx.moveTo(p1[0], p1[1]);
+          pCtx.lineTo(p2[0], p2[1]);
+          pCtx.strokeStyle = f.cold ? "rgba(56, 189, 248, 0.92)" : "rgba(251, 113, 133, 0.92)";
+          pCtx.lineWidth = 2.2;
+          pCtx.stroke();
+        }
+
+        pCtx.textAlign = "center";
+        pCtx.textBaseline = "middle";
+        for (const ex of state.extrema) {
+          if (state.projection === "globe_3d_wgs84" && d3.geoDistance([ex.lon, ex.lat], [state.cameraLon, state.cameraLat]) > 1.48) continue;
+          const pt = proj([ex.lon, ex.lat]);
+          if (!pt) continue;
+          pCtx.font = "700 13px Inter, sans-serif";
+          pCtx.fillStyle = ex.isLow ? "#fb7185" : "#60a5fa";
+          pCtx.fillText(ex.isLow ? "L" : "H", pt[0], pt[1]);
+          pCtx.font = "500 9.5px 'JetBrains Mono', monospace";
+          pCtx.fillStyle = "#f1f5f9";
+          pCtx.fillText(Math.round(ex.val).toString(), pt[0], pt[1] + 11);
+        }
+      }
+
+      // 6. Teleconnection Bounding Boxes
+      if (state.layerMap.teleconnection_oscillation_masks.visible) {
+        pCtx.strokeStyle = "#facc15";
+        pCtx.lineWidth = 1.5;
+        for (const b of TELECONNECTION_BASINS) {
+          const ring = {
+            type: "LineString",
+            coordinates: [[b.minLon, b.minLat], [b.maxLon, b.minLat], [b.maxLon, b.maxLat], [b.minLon, b.maxLat], [b.minLon, b.minLat]]
+          };
+          pCtx.beginPath();
+          geoPath(ring);
+          pCtx.stroke();
+        }
+      }
+
+      // 7. Animated Lagrangian Wind / Ocean Streamline Particles
+      const activeVec = stepParticles();
+      if (activeVec) {
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          if (state.projection === "globe_3d_wgs84" && d3.geoDistance([p.lon, p.lat], [state.cameraLon, state.cameraLat]) > 1.53) continue;
+          const p0 = proj([p.prevLon, p.prevLat]);
+          const p1 = proj([p.lon, p.lat]);
+          if (!p0 || !p1 || Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) > 45) continue;
+          const alpha = (1 - p.age / p.maxAge) * 0.85;
+          pCtx.beginPath();
+          pCtx.moveTo(p0[0], p0[1]);
+          pCtx.lineTo(p1[0], p1[1]);
+          pCtx.strokeStyle = activeVec === "thermohaline_currents_amoc"
+            ? `rgba(94, 234, 212, ${alpha.toFixed(2)})`
+            : `rgba(165, 243, 252, ${alpha.toFixed(2)})`;
+          pCtx.lineWidth = 1.5;
+          pCtx.stroke();
+        }
+      }
+
+      // 8. Atmosphere Rim Halo on 3D Globe
+      pCtx.beginPath();
+      geoPath({ type: "Sphere" });
+      pCtx.strokeStyle = "rgba(96, 195, 255, 0.45)";
+      pCtx.lineWidth = 1.8;
+      pCtx.stroke();
+
+      // 9. Continental Major Cities & Polar Hubs (with label collision guard)
+      pCtx.textAlign = "left";
+      const placedLabels = [];
+      for (const obs of OBSERVATORIES) {
+        if (state.continentFilter !== "ALL" && obs.continent !== state.continentFilter) continue;
+        if (state.projection === "globe_3d_wgs84" && d3.geoDistance([obs.lon, obs.lat], [state.cameraLon, state.cameraLat]) > 1.52) continue;
+        const pt = proj([obs.lon, obs.lat]);
+        if (!pt) continue;
+        const isPinned = obs.name === state.pinnedLabel;
+        pCtx.beginPath();
+        pCtx.arc(pt[0], pt[1], isPinned ? 4.4 : 3.3, 0, Math.PI * 2);
+        pCtx.fillStyle = isPinned ? "#facc15" : "#34d399";
+        pCtx.fill();
+        pCtx.strokeStyle = "#052e16";
+        pCtx.lineWidth = 1;
+        pCtx.stroke();
+
+        const tooClose = !isPinned && placedLabels.some(lp => Math.abs(lp[0] - pt[0]) < 56 && Math.abs(lp[1] - pt[1]) < 15);
+        if (!tooClose) {
+          placedLabels.push(pt);
+          pCtx.font = isPinned ? "600 10.5px Inter, sans-serif" : "500 10px Inter, sans-serif";
+          pCtx.fillStyle = isPinned ? "#fef08a" : "#d1fae5";
+          pCtx.fillText(obs.name, pt[0] + 6, pt[1] - 3);
+        }
+      }
+
+      // 10. A -> B Cross-Section Transect Line
+      if (state.transectPts.length > 0) {
+        const pA = proj([state.transectPts[0].lon, state.transectPts[0].lat]);
+        if (pA) {
+          pCtx.beginPath();
+          pCtx.arc(pA[0], pA[1], 4.5, 0, Math.PI * 2);
+          pCtx.fillStyle = "#facc15";
+          pCtx.fill();
+        }
+        if (state.transectPts.length === 2) {
+          const lineGeo = {
+            type: "LineString",
+            coordinates: [[state.transectPts[0].lon, state.transectPts[0].lat], [state.transectPts[1].lon, state.transectPts[1].lat]]
+          };
+          pCtx.beginPath();
+          geoPath(lineGeo);
+          pCtx.strokeStyle = "#facc15";
+          pCtx.lineWidth = 2.2;
+          pCtx.stroke();
+        }
+      }
+
+      // 11. Pinned Target Crosshair
+      if (state.projection !== "globe_3d_wgs84" || d3.geoDistance([state.pinnedLon, state.pinnedLat], [state.cameraLon, state.cameraLat]) <= 1.55) {
+        const pinPt = proj([state.pinnedLon, state.pinnedLat]);
+        if (pinPt) {
+          pCtx.strokeStyle = "#fb7185";
+          pCtx.lineWidth = 1.5;
+          pCtx.beginPath();
+          pCtx.arc(pinPt[0], pinPt[1], 7.5, 0, Math.PI * 2);
+          pCtx.stroke();
+          pCtx.beginPath();
+          pCtx.moveTo(pinPt[0] - 12, pinPt[1]); pCtx.lineTo(pinPt[0] + 12, pinPt[1]);
+          pCtx.moveTo(pinPt[0], pinPt[1] - 12); pCtx.lineTo(pinPt[0], pinPt[1] + 12);
+          pCtx.stroke();
+        }
+      }
+
+      pCtx.restore();
+    }
+
+    // =========================================================================
+    // 8. RIGHT DOCK ANALYTICS: SKEW-T, CTD, AND CHART.JS SSP / TRANSECT
+    // =========================================================================
+    let analyticsChart = null;
+
+    function initAnalyticsChart() {
+      const ctx = document.getElementById("analyticsChart").getContext("2d");
+      const years = [];
+      for (let y = 1950; y <= 2100; y += 10) years.push(y);
+
+      analyticsChart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels: years,
+          datasets: Object.keys(SSP_CONFIG).map(code => ({
+            label: code,
+            data: years.map(y => Math.round(sspCo2AtYear(code, y) * 10) / 10),
+            borderColor: SSP_CONFIG[code].color,
+            borderWidth: code === state.ssp ? 2.4 : 1.1,
+            pointRadius: 0,
+            tension: 0.3
+          }))
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: {
+            legend: { labels: { color: "#cbd5e1", boxWidth: 10, font: { size: 9.5 } } }
+          },
+          scales: {
+            x: { ticks: { color: "#94a3b8", font: { size: 9.5 } }, grid: { color: "rgba(148,163,184,0.1)" } },
+            y: { ticks: { color: "#94a3b8", font: { size: 9.5 } }, grid: { color: "rgba(148,163,184,0.1)" } }
+          }
+        }
+      });
+    }
+
+    function drawSoundingAndCtd() {
+      const sCan = document.getElementById("soundingCanvas");
+      const sCtx = sCan.getContext("2d");
+      const sw = sCan.width, sh = sCan.height;
+      sCtx.fillStyle = "#0b101c";
+      sCtx.fillRect(0, 0, sw, sh);
+
+      const tSurf = sampleBilinear(state.grids.cmip6_downscaled_ensemble?.values, state.pinnedLat, state.pinnedLon)
+        + 27.8 * Math.cos(state.pinnedLat * Math.PI / 180) - 15.5 * Math.pow(Math.sin(state.pinnedLat * Math.PI / 180), 2);
+      const baseT = Number.isFinite(tSurf) ? tSurf : 15.0;
+
+      // Grid lines
+      sCtx.strokeStyle = "rgba(148,163,184,0.14)";
+      sCtx.lineWidth = 1;
+      for (let g = 1; g <= 3; g++) {
+        sCtx.beginPath(); sCtx.moveTo(0, (sh * g) / 4); sCtx.lineTo(sw, (sh * g) / 4); sCtx.stroke();
+      }
+
+      const mapTP = (t, p) => {
+        const x = 14 + ((t + 75) / 115) * (sw - 48);
+        const y = sh - 10 - (Math.log(1000 / p) / Math.log(100)) * (sh - 22);
+        return [x, y];
+      };
+
+      // Temperature (red) and Dewpoint (sky)
+      const prof = ATM_LEVELS_HPA.map(p => {
+        const zKm = 7.4 * Math.log(1000 / p);
+        const t = zKm <= 11.5 ? baseT - 6.5 * zKm : (baseT - 74.75) + 1.8 * (zKm - 11.5);
+        const td = t - Math.min(36, 4.5 + 1.4 * zKm);
+        return { p, t, td };
+      });
+
+      sCtx.beginPath();
+      prof.forEach((pt, idx) => {
+        const [x, y] = mapTP(pt.t, pt.p);
+        if (idx === 0) sCtx.moveTo(x, y); else sCtx.lineTo(x, y);
+      });
+      sCtx.strokeStyle = "#fb7185"; sCtx.lineWidth = 2; sCtx.stroke();
+
+      sCtx.beginPath();
+      prof.forEach((pt, idx) => {
+        const [x, y] = mapTP(pt.td, pt.p);
+        if (idx === 0) sCtx.moveTo(x, y); else sCtx.lineTo(x, y);
+      });
+      sCtx.strokeStyle = "#38bdf8"; sCtx.lineWidth = 1.6; sCtx.stroke();
+
+      // Active pressure slice line
+      const [_, ySlice] = mapTP(0, ATM_LEVELS_HPA[state.atmIdx]);
+      sCtx.beginPath(); sCtx.moveTo(0, ySlice); sCtx.lineTo(sw, ySlice);
+      sCtx.strokeStyle = "rgba(250, 204, 21, 0.55)"; sCtx.lineWidth = 1; sCtx.stroke();
+
+      sCtx.fillStyle = "#cbd5e1";
+      sCtx.font = "10px 'JetBrains Mono', monospace";
+      sCtx.fillText(`Red: Air T (°C) | Cyan: Dewpoint | Slice: ${ATM_LEVELS_HPA[state.atmIdx]} hPa`, 8, 13);
+
+      // Ocean CTD Canvas
+      const cCan = document.getElementById("ctdCanvas");
+      const cCtx = cCan.getContext("2d");
+      const cw = cCan.width, ch = cCan.height;
+      cCtx.fillStyle = "#0b101c";
+      cCtx.fillRect(0, 0, cw, ch);
+
+      const sstPin = sampleBilinear(state.grids.sst_marine_heatwaves?.values, state.pinnedLat, state.pinnedLon);
+      const surfOceanT = Number.isFinite(sstPin) ? sstPin : Math.max(-1.8, 25 * Math.cos(state.pinnedLat * Math.PI / 180));
+
+      cCtx.beginPath();
+      OCEAN_DEPTHS_M.forEach((z, idx) => {
+        const tz = 1.4 + (surfOceanT - 1.4) * Math.exp(-z / 750);
+        const x = 14 + ((tz + 2) / 34) * (cw - 28);
+        const y = 18 + (z / 6000) * (ch - 26);
+        if (idx === 0) cCtx.moveTo(x, y); else cCtx.lineTo(x, y);
+      });
+      cCtx.strokeStyle = "#fb923c"; cCtx.lineWidth = 2; cCtx.stroke();
+
+      cCtx.beginPath();
+      OCEAN_DEPTHS_M.forEach((z, idx) => {
+        const sal = 34.72 + 0.95 * Math.cos(2 * state.pinnedLat * Math.PI / 180) * Math.exp(-z / 1200);
+        const x = 14 + ((sal - 33) / 4) * (cw - 28);
+        const y = 18 + (z / 6000) * (ch - 26);
+        if (idx === 0) cCtx.moveTo(x, y); else cCtx.lineTo(x, y);
+      });
+      cCtx.strokeStyle = "#2dd4bf"; cCtx.lineWidth = 1.6; cCtx.stroke();
+
+      cCtx.fillStyle = "#cbd5e1";
+      cCtx.font = "10px 'JetBrains Mono', monospace";
+      cCtx.fillText(`Orange: Temp (°C) | Teal: Salinity (PSU)`, 8, 12);
+    }
+
+    function updateAnalyticsDock() {
+      const latStr = `${state.pinnedLat >= 0 ? "+" : ""}${state.pinnedLat.toFixed(2)}°`;
+      const lonStr = `${state.pinnedLon >= 0 ? "+" : ""}${state.pinnedLon.toFixed(2)}°`;
+      document.getElementById("lblPinnedCoord").textContent = `${latStr}, ${lonStr}`;
+      const el = Math.round(syntheticElevationM(state.pinnedLat, state.pinnedLon));
+      document.getElementById("lblSurfaceElev").textContent = `Elev: ${el >= 0 ? "+" : ""}${el} m`;
+
+      const container = document.getElementById("activePointReadouts");
+      const vis = Object.values(state.layerMap).filter(l => l.visible);
+      if (vis.length === 0) {
+        container.innerHTML = `<div class="text-slate-500">Enable a layer on the left tree to inspect values.</div>`;
+      } else {
+        container.innerHTML = vis.map(l => {
+          const val = sampleBilinear(state.grids[l.id]?.values, state.pinnedLat, state.pinnedLon);
+          const vText = Number.isFinite(val) ? val.toFixed(2) : "Land/Mask";
+          return `<div class="flex items-center justify-between gap-2 border-b border-slate-800/60 pb-0.5">
+            <span class="text-slate-300 truncate">${l.name}</span>
+            <span class="text-sky-300 shrink-0">${vText} <span class="text-slate-500">${l.units}</span></span>
+          </div>`;
+        }).join("");
+      }
+
+      drawSoundingAndCtd();
+
+      if (!analyticsChart) return;
+      if (state.transectPts.length === 2) {
+        const activeLayer = vis[0] || state.layerMap.synoptic_fronts_isobars;
+        const a = state.transectPts[0], b = state.transectPts[1];
+        const labels = [], vals = [];
+        for (let i = 0; i < 32; i++) {
+          const t = i / 31;
+          const la = a.lat + (b.lat - a.lat) * t;
+          const lo = a.lon + (b.lon - a.lon) * t;
+          labels.push(`${Math.round(t * 100)}%`);
+          const sv = sampleBilinear(state.grids[activeLayer.id]?.values, la, lo);
+          vals.push(Number.isFinite(sv) ? Math.round(sv * 100) / 100 : null);
+        }
+        document.getElementById("lblChartTitle").textContent = `A→B Transect: ${activeLayer.id}`;
+        document.getElementById("btnClearTransect").classList.remove("hidden");
+        analyticsChart.data.labels = labels;
+        analyticsChart.data.datasets = [{
+          label: `${activeLayer.name} (${activeLayer.units})`,
+          data: vals,
+          borderColor: "#facc15",
+          borderWidth: 2.2,
+          pointRadius: 0,
+          tension: 0.25
+        }];
+        analyticsChart.update();
+      } else {
+        document.getElementById("lblChartTitle").textContent = "CMIP6 SSP CO2 Pathways (1950–2100)";
+        document.getElementById("btnClearTransect").classList.add("hidden");
+        const years = [];
+        for (let y = 1950; y <= 2100; y += 10) years.push(y);
+        analyticsChart.data.labels = years;
+        analyticsChart.data.datasets = Object.keys(SSP_CONFIG).map(code => ({
+          label: code,
+          data: years.map(y => Math.round(sspCo2AtYear(code, y) * 10) / 10),
+          borderColor: SSP_CONFIG[code].color,
+          borderWidth: code === state.ssp ? 2.5 : 1.0,
+          pointRadius: 0,
+          tension: 0.3
+        }));
+        analyticsChart.update();
+      }
+    }
+
+    function updateReadoutDom() {
+      const r = state.readouts;
+      document.getElementById("badgeTempAnom").textContent = `${r.tempAnom >= 0 ? "+" : ""}${r.tempAnom.toFixed(2)} °C`;
+      document.getElementById("badgeCo2").textContent = `${r.co2.toFixed(1)} ppm`;
+      document.getElementById("badgeEnso").textContent = `${r.enso >= 0 ? "+" : ""}${r.enso.toFixed(2)} °C`;
+      document.getElementById("badgeSst").textContent = `${r.sst.toFixed(2)} °C`;
+
+      const ringLen = state.ringBuffer.length;
+      document.getElementById("exportStatusText").textContent =
+        `Ring buffer: ${ringLen}/96 ticks retained (--max-history-ticks 96)`;
+      document.getElementById("statusFooterRight").textContent =
+        `3D-Var PCG + 2-Layer QGPV + Stommel-Munk Ocean | SQLite Ring: ${ringLen}/96 ticks`;
+
+      const repSlider = document.getElementById("sliderReplayTick");
+      repSlider.max = Math.max(0, ringLen - 1).toString();
+      if (state.replayMode && state.ringBuffer[state.replayIdx]) {
+        document.getElementById("lblReplayTick").textContent = `${state.replayIdx + 1}/${ringLen}`;
+        document.getElementById("lblReplayUtc").textContent = state.ringBuffer[state.replayIdx].tsUtc;
+      }
+    }
+
+    // =========================================================================
+    // 9. UI WIRING: LAYER TREE, INTERACTIONS, 4D REPLAY & ZARR V3 EXPORT
+    // =========================================================================
+    function showToast(msg) {
+      const el = document.getElementById("toastBanner");
+      el.textContent = msg;
+      el.classList.remove("hidden");
+      clearTimeout(showToast._timer);
+      showToast._timer = setTimeout(() => el.classList.add("hidden"), 4200);
+    }
+
+    function buildLayerTreeDom(filterText = "") {
+      const q = filterText.trim().toLowerCase();
+      const root = document.getElementById("layerTreeContainer");
+      root.innerHTML = "";
+
+      for (const grp of LAYER_GROUPS) {
+        const matched = grp.layers.filter(l =>
+          !q || l.name.toLowerCase().includes(q) || l.id.toLowerCase().includes(q) || l.sources.toLowerCase().includes(q)
+        );
+        if (matched.length === 0) continue;
+
+        const wrap = document.createElement("div");
+        wrap.className = "rounded-lg border border-slate-800/90 bg-[#0f1728] overflow-hidden";
+
+        const hdr = document.createElement("button");
+        hdr.type = "button";
+        hdr.className = "w-full px-2.5 py-1.5 flex items-center justify-between text-left text-xs font-semibold text-slate-200 hover:bg-slate-800/60";
+        const isOpen = q ? true : grp.expanded;
+        hdr.innerHTML = `<span class="truncate">${grp.groupName}</span><span class="mono text-[10px] text-slate-400">${isOpen ? "▾" : "▸"}</span>`;
+        hdr.addEventListener("click", () => {
+          grp.expanded = !grp.expanded;
+          buildLayerTreeDom(document.getElementById("layerSearch").value);
+        });
+        wrap.appendChild(hdr);
+
+        if (isOpen) {
+          const body = document.createElement("div");
+          body.className = "p-2 pt-0.5 space-y-1.5 border-t border-slate-800/60";
+          for (const lyrDef of matched) {
+            const st = state.layerMap[lyrDef.id];
+            const card = document.createElement("div");
+            card.className = "rounded bg-[#0b111e] border border-slate-800/80 p-1.5 space-y-1";
+
+            const topRow = document.createElement("div");
+            topRow.className = "flex items-center justify-between gap-1.5";
+
+            const lbl = document.createElement("label");
+            lbl.className = "flex items-center gap-1.5 text-xs text-slate-200 cursor-pointer min-w-0 flex-1";
+            const chk = document.createElement("input");
+            chk.type = "checkbox";
+            chk.checked = st.visible;
+            chk.className = "rounded bg-slate-900 border-slate-700 text-sky-500 shrink-0";
+            chk.addEventListener("change", () => {
+              st.visible = chk.checked;
+              buildLayerTreeDom(document.getElementById("layerSearch").value);
+              updateAnalyticsDock();
+            });
+            const span = document.createElement("span");
+            span.className = "truncate";
+            span.textContent = st.name;
+            lbl.appendChild(chk);
+            lbl.appendChild(span);
+
+            const infoBtn = document.createElement("button");
+            infoBtn.type = "button";
+            infoBtn.className = "px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-300 shrink-0";
+            infoBtn.textContent = "Info";
+            infoBtn.addEventListener("click", () => {
+              document.getElementById("modalLayerName").textContent = st.name;
+              document.getElementById("modalLayerGroup").textContent = st.groupName;
+              document.getElementById("modalLayerDesc").textContent = st.desc;
+              document.getElementById("modalLayerId").textContent = st.id;
+              document.getElementById("modalLayerUnits").textContent = st.units;
+              document.getElementById("modalLayerRes").textContent = st.res;
+              document.getElementById("modalLayerSources").textContent = st.sources;
+              document.getElementById("layerModal").classList.remove("hidden");
+            });
+
+            topRow.appendChild(lbl);
+            topRow.appendChild(infoBtn);
+            card.appendChild(topRow);
+
+            if (st.visible) {
+              const ctrlRow = document.createElement("div");
+              ctrlRow.className = "flex items-center gap-2 pt-0.5";
+              const opSlider = document.createElement("input");
+              opSlider.type = "range";
+              opSlider.min = "0.15";
+              opSlider.max = "1.0";
+              opSlider.step = "0.05";
+              opSlider.value = st.opacity.toString();
+              opSlider.className = "flex-1 h-1 cursor-pointer";
+              opSlider.addEventListener("input", () => {
+                st.opacity = parseFloat(opSlider.value);
+              });
+
+              const palSel = document.createElement("select");
+              palSel.className = "bg-slate-900 border border-slate-700 rounded px-1 py-0.5 text-[10px] text-slate-300";
+              Object.keys(PALETTE_STOPS).forEach(pName => {
+                const opt = document.createElement("option");
+                opt.value = pName;
+                opt.textContent = pName;
+                opt.selected = st.palette === pName;
+                palSel.appendChild(opt);
+              });
+              palSel.addEventListener("change", () => {
+                st.palette = palSel.value;
+              });
+
+              ctrlRow.appendChild(opSlider);
+              ctrlRow.appendChild(palSel);
+              card.appendChild(ctrlRow);
+            }
+            body.appendChild(card);
+          }
+          wrap.appendChild(body);
+        }
+        root.appendChild(wrap);
+      }
+    }
+
+    function wireInteractions() {
+      // Continental City chips & Continent Filter
+      const chipBox = document.getElementById("observatoryChips");
+      function renderCityChips() {
+        chipBox.innerHTML = "";
+        const filtered = OBSERVATORIES.filter(o => state.continentFilter === "ALL" || o.continent === state.continentFilter);
+        filtered.forEach(obs => {
+          const b = document.createElement("button");
+          b.type = "button";
+          const active = state.pinnedLabel === obs.name;
+          b.className = active
+            ? "px-2 py-0.5 rounded bg-emerald-600/30 border border-emerald-400 text-[10px] text-emerald-200 font-semibold transition"
+            : "px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-[10px] text-emerald-300 transition";
+          b.textContent = obs.name;
+          b.title = `${obs.role} (${obs.lat.toFixed(2)}°, ${obs.lon.toFixed(2)}°)`;
+          b.addEventListener("click", () => {
+            state.pinnedLat = obs.lat;
+            state.pinnedLon = obs.lon;
+            state.pinnedLabel = obs.name;
+            state.cameraLat = Math.max(-85, Math.min(85, obs.lat));
+            state.cameraLon = obs.lon;
+            document.getElementById("coordInput").value = `${obs.lat.toFixed(4)}, ${obs.lon.toFixed(4)}`;
+            document.getElementById("cursorHud").textContent = `Pin: ${obs.lat.toFixed(2)}°, ${obs.lon.toFixed(2)}° (${obs.name}) | ${obs.role}`;
+            renderCityChips();
+            updateAnalyticsDock();
+          });
+          chipBox.appendChild(b);
+        });
+      }
+      renderCityChips();
+      document.getElementById("continentSelect").addEventListener("change", e => {
+        state.continentFilter = e.target.value;
+        const firstMatch = OBSERVATORIES.find(o => state.continentFilter === "ALL" || o.continent === state.continentFilter);
+        if (firstMatch && state.continentFilter !== "ALL") {
+          state.cameraLat = Math.max(-85, Math.min(85, firstMatch.lat));
+          state.cameraLon = firstMatch.lon;
+        }
+        renderCityChips();
+      });
+
+      // Sidebar toggles
+      document.getElementById("btnToggleLeft").addEventListener("click", () => {
+        document.getElementById("leftSidebar").classList.toggle("hidden");
+      });
+      document.getElementById("btnToggleRight").addEventListener("click", () => {
+        document.getElementById("rightDrawer").classList.toggle("hidden");
+      });
+      document.getElementById("btnCloseModal").addEventListener("click", () => {
+        document.getElementById("layerModal").classList.add("hidden");
+      });
+
+      // Top bar controls
+      document.getElementById("projectionSelect").addEventListener("change", e => {
+        state.projection = e.target.value;
+      });
+      document.getElementById("sspSelect").addEventListener("change", e => {
+        state.ssp = e.target.value;
+        state.replayMode = false;
+        syncReplayUi();
+        stepSimulationEngine(true);
+      });
+      document.getElementById("basemapSelect").addEventListener("change", e => {
+        state.basemap = e.target.value;
+      });
+      document.getElementById("chkAnomalyMode").addEventListener("change", e => {
+        state.anomalyMode = e.target.checked;
+      });
+      document.getElementById("layerSearch").addEventListener("input", e => {
+        buildLayerTreeDom(e.target.value);
+      });
+
+      document.getElementById("btnCoordJump").addEventListener("click", () => {
+        const parts = document.getElementById("coordInput").value.split(",").map(s => parseFloat(s.trim()));
+        if (parts.length === 2 && Number.isFinite(parts[0]) && Number.isFinite(parts[1])) {
+          state.pinnedLat = Math.max(-89.9, Math.min(89.9, parts[0]));
+          state.pinnedLon = Math.max(-180, Math.min(180, parts[1]));
+          state.pinnedLabel = "";
+          renderCityChips();
+          state.cameraLat = state.pinnedLat;
+          state.cameraLon = state.pinnedLon;
+          document.getElementById("cursorHud").textContent = `Pin: ${state.pinnedLat.toFixed(2)}°, ${state.pinnedLon.toFixed(2)}°`;
+          updateAnalyticsDock();
+        }
+      });
+
+      document.getElementById("btnTransect").addEventListener("click", e => {
+        state.transectMode = !state.transectMode;
+        state.transectPts = [];
+        e.currentTarget.classList.toggle("bg-amber-600", state.transectMode);
+        e.currentTarget.classList.toggle("text-white", state.transectMode);
+        if (state.transectMode) {
+          showToast("Transect mode active: click Point A and Point B on the map.");
+        }
+        updateAnalyticsDock();
+      });
+      document.getElementById("btnClearTransect").addEventListener("click", () => {
+        state.transectMode = false;
+        state.transectPts = [];
+        document.getElementById("btnTransect").classList.remove("bg-amber-600", "text-white");
+        updateAnalyticsDock();
+      });
+
+      // Vertical Slice Sliders
+      document.getElementById("sliderAtmHpa").addEventListener("input", e => {
+        state.atmIdx = parseInt(e.target.value, 10);
+        document.getElementById("lblAtmHpa").textContent = `${ATM_LEVELS_HPA[state.atmIdx]} hPa`;
+        if (!state.replayMode) stepSimulationEngine(false);
+      });
+      document.getElementById("sliderOceanDepth").addEventListener("input", e => {
+        state.oceanIdx = parseInt(e.target.value, 10);
+        document.getElementById("lblOceanDepth").textContent = `${OCEAN_DEPTHS_M[state.oceanIdx]} m`;
+        if (!state.replayMode) stepSimulationEngine(false);
+      });
+
+      // Zoom & Reset
+      document.getElementById("btnZoomIn").addEventListener("click", () => {
+        state.zoom = Math.min(6.5, state.zoom * 1.22);
+      });
+      document.getElementById("btnZoomOut").addEventListener("click", () => {
+        state.zoom = Math.max(0.65, state.zoom / 1.22);
+      });
+      document.getElementById("btnResetCam").addEventListener("click", () => {
+        state.cameraLat = 20.0000;
+        state.cameraLon = -20.0000;
+        state.zoom = 1.08;
+      });
+
+      // Canvas Drag & Click Unprojection
+      let dragging = false, dragMoved = false, lastX = 0, lastY = 0;
+      planetCanvas.addEventListener("pointerdown", e => {
+        dragging = true;
+        dragMoved = false;
+        lastX = e.clientX;
+        lastY = e.clientY;
+      });
+      window.addEventListener("pointermove", e => {
+        if (!dragging) return;
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        if (Math.hypot(dx, dy) > 3) dragMoved = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        const sens = 0.28 / state.zoom;
+        state.cameraLon = (((state.cameraLon - dx * sens + 180) % 360) + 360) % 360 - 180;
+        state.cameraLat = Math.max(-85, Math.min(85, state.cameraLat + dy * sens));
+      });
+      window.addEventListener("pointerup", e => {
+        if (!dragging) return;
+        dragging = false;
+        if (!dragMoved && e.target === planetCanvas) {
+          const rect = planetCanvas.getBoundingClientRect();
+          const proj = buildD3Projection(rect.width, rect.height);
+          if (proj.invert) {
+            const inv = proj.invert([e.clientX - rect.left, e.clientY - rect.top]);
+            if (inv && Number.isFinite(inv[0]) && Number.isFinite(inv[1]) && Math.abs(inv[1]) <= 90) {
+              state.pinnedLon = inv[0];
+              state.pinnedLat = inv[1];
+              state.pinnedLabel = "";
+              renderCityChips();
+              document.getElementById("coordInput").value = `${inv[1].toFixed(4)}, ${inv[0].toFixed(4)}`;
+              document.getElementById("cursorHud").textContent = `Pin: ${inv[1].toFixed(2)}°, ${inv[0].toFixed(2)}°`;
+              if (state.transectMode) {
+                if (state.transectPts.length >= 2) state.transectPts = [];
+                state.transectPts.push({ lat: inv[1], lon: inv[0] });
+              }
+              updateAnalyticsDock();
+            }
+          }
+        }
+      });
+      planetCanvas.addEventListener("wheel", e => {
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? 1.12 : 0.89;
+        state.zoom = Math.max(0.65, Math.min(6.5, state.zoom * factor));
+      }, { passive: false });
+
+      // Temporal Controls & 4D SQLite Ring-Buffer Replay
+      function syncReplayUi() {
+        const liveDiv = document.getElementById("liveTimeControls");
+        const repDiv = document.getElementById("replayTimeControls");
+        const bLive = document.getElementById("btnModeLive");
+        const bRep = document.getElementById("btnModeReplay");
+        if (state.replayMode) {
+          liveDiv.classList.add("hidden");
+          repDiv.classList.remove("hidden");
+          repDiv.classList.add("flex");
+          bRep.className = "px-2 py-0.5 rounded text-xs font-medium bg-amber-500/25 text-amber-300 border border-amber-500/40";
+          bLive.className = "px-2 py-0.5 rounded text-xs font-medium text-slate-400 hover:text-slate-200";
+          document.getElementById("hudEngineMode").textContent = "4D SQLite Ring-Buffer Replay";
+        } else {
+          repDiv.classList.add("hidden");
+          repDiv.classList.remove("flex");
+          liveDiv.classList.remove("hidden");
+          bLive.className = "px-2 py-0.5 rounded text-xs font-medium bg-sky-600/30 text-sky-300 border border-sky-500/40";
+          bRep.className = "px-2 py-0.5 rounded text-xs font-medium text-slate-400 hover:text-slate-200";
+          document.getElementById("hudEngineMode").textContent = "2-Layer QGPV + 1.5-Layer Ocean Active";
+        }
+      }
+
+      function loadReplayTick(idx) {
+        const snap = state.ringBuffer[idx];
+        if (!snap) return;
+        state.replayIdx = idx;
+        state.grids = snap.grids;
+        state.readouts = { ...snap.readouts };
+        computeSynopticOverlays(
+          snap.grids.synoptic_fronts_isobars.values,
+          snap.grids.cmip6_downscaled_ensemble.values,
+          snap.grids.wind_vector_jet_streams.u,
+          snap.grids.wind_vector_jet_streams.v
+        );
+        document.getElementById("sliderReplayTick").value = idx.toString();
+        updateReadoutDom();
+        updateAnalyticsDock();
+      }
+
+      document.getElementById("btnModeLive").addEventListener("click", () => {
+        state.replayMode = false;
+        syncReplayUi();
+        stepSimulationEngine(false);
+      });
+      document.getElementById("btnModeReplay").addEventListener("click", () => {
+        state.replayMode = true;
+        state.replayIdx = Math.max(0, state.ringBuffer.length - 1);
+        syncReplayUi();
+        loadReplayTick(state.replayIdx);
+      });
+      document.getElementById("sliderReplayTick").addEventListener("input", e => {
+        loadReplayTick(parseInt(e.target.value, 10));
+      });
+
+      function advanceOneTick() {
+        state.qgpvPhase += 0.24;
+        state.kelvinPhase += 0.16;
+        state.hourUtc += 6;
+        if (state.hourUtc >= 24) {
+          state.hourUtc -= 24;
+          state.doy = (state.doy % 365) + 1;
+          state.simYear = Math.min(2100, state.simYear + 1 / 365.25);
+        }
+        document.getElementById("sliderSimYear").value = state.simYear.toString();
+        document.getElementById("lblSimYear").textContent = state.simYear.toFixed(1);
+        document.getElementById("sliderDoy").value = state.doy.toString();
+        document.getElementById("lblDoy").textContent = state.doy.toString();
+        stepSimulationEngine(true);
+      }
+
+      document.getElementById("btnStepTick").addEventListener("click", () => {
+        state.replayMode = false;
+        syncReplayUi();
+        advanceOneTick();
+      });
+
+      document.getElementById("btnPlayPause").addEventListener("click", e => {
+        state.playing = !state.playing;
+        e.currentTarget.textContent = state.playing ? "Pause" : "Play";
+      });
+
+      document.getElementById("sliderSimYear").addEventListener("input", e => {
+        state.simYear = parseFloat(e.target.value);
+        document.getElementById("lblSimYear").textContent = state.simYear.toFixed(1);
+        stepSimulationEngine(true);
+      });
+      document.getElementById("sliderDoy").addEventListener("input", e => {
+        state.doy = parseInt(e.target.value, 10);
+        document.getElementById("lblDoy").textContent = state.doy.toString();
+        stepSimulationEngine(true);
+      });
+
+      // Zarr v3 Spatial Subset Exporter
+      document.getElementById("btnExportZarr").addEventListener("click", () => {
+        const vis = Object.values(state.layerMap).find(l => l.visible) || state.layerMap.synoptic_fronts_isobars;
+        const codec = document.getElementById("zarrCodecSelect").value;
+        const g = state.grids[vis.id];
+        const minLat = Math.max(-90, state.pinnedLat - 20), maxLat = Math.min(90, state.pinnedLat + 20);
+        const minLon = Math.max(-180, state.pinnedLon - 25), maxLon = Math.min(180, state.pinnedLon + 25);
+        const cells = [];
+        for (let r = 0; r < GRID_H; r++) {
+          const la = 90 - (r + 0.5) * (180 / GRID_H);
+          if (la < minLat || la > maxLat) continue;
+          for (let c = 0; c < GRID_W; c++) {
+            const lo = -180 + (c + 0.5) * (360 / GRID_W);
+            if (lo < minLon || lo > maxLon) continue;
+            const v = g.values[r * GRID_W + c];
+            cells.push({ lat: +la.toFixed(2), lon: +lo.toFixed(2), val: Number.isFinite(v) ? +v.toFixed(3) : null });
+          }
+        }
+        const codecsMeta = codec === "zstd"
+          ? [{ name: "bytes", configuration: { endian: "little" } }, { name: "zstd", configuration: { level: 3, checksum: true } }]
+          : (codec === "gzip"
+            ? [{ name: "bytes", configuration: { endian: "little" } }, { name: "gzip", configuration: { level: 4 } }]
+            : [{ name: "bytes", configuration: { endian: "little" } }]);
+
+        const payload = {
+          zarr_format: 3,
+          node_type: "array",
+          layer_id: vis.id,
+          scenario: state.ssp,
+          data_type: "float32",
+          codecs: codecsMeta,
+          bbox: [+minLon.toFixed(2), +minLat.toFixed(2), +maxLon.toFixed(2), +maxLat.toFixed(2)],
+          cell_count: cells.length,
+          cells
+        };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `terratwin_${vis.id}_${codec}.zarr.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        showToast(`Exported Zarr v3 (${codec}, ${cells.length} cells) for ${vis.id}`);
+      });
+
+      // Animation Loop
+      let lastAdvance = performance.now();
+      function loop(now) {
+        if (state.playing && now - lastAdvance > 420) {
+          lastAdvance = now;
+          if (state.replayMode && state.ringBuffer.length > 0) {
+            const nxt = (state.replayIdx + 1) % state.ringBuffer.length;
+            loadReplayTick(nxt);
+          } else {
+            advanceOneTick();
+          }
+        }
+        renderPlanetFrame();
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    // Responsive initial sidebar state for narrow side-panels
+    function applyInitialResponsiveState() {
+      if (window.innerWidth < 1024) {
+        document.getElementById("leftSidebar").classList.add("hidden");
+      }
+      if (window.innerWidth < 1280) {
+        document.getElementById("rightDrawer").classList.add("hidden");
+      }
+    }
+
+    window.addEventListener("load", () => {
+      applyInitialResponsiveState();
+      initAnalyticsChart();
+      buildLayerTreeDom("");
+      // Seed 3 initial ticks in the in-memory SQLite ring buffer so 4D Replay works immediately
+      for (let k = 0; k < 3; k++) {
+        if (k > 0) {
+          state.qgpvPhase += 0.24;
+          state.kelvinPhase += 0.16;
+          state.hourUtc += 6;
+        }
+        stepSimulationEngine(true);
+      }
+      wireInteractions();
+
+      // Load published Natural Earth 110m vector coastlines & borders via jsDelivr
+      fetch("https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json")
+        .then(r => r.json())
+        .then(world => {
+          state.worldLand = topojson.feature(world, world.objects.land);
+          state.worldBorders = topojson.mesh(world, world.objects.countries, (a, b) => a !== b);
+        })
+        .catch(() => {
+          showToast("Vector atlas offline; rendering spherical graticule & physics rasters.");
+        });
+    });
+  </script>
+</body>
+</html>

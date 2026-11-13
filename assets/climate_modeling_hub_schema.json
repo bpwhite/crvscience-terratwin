@@ -1,0 +1,890 @@
+{
+  "application": {
+    "id": "planetary-climate-telemetry-hub",
+    "name": "TerraTwin HPC Climate Modeling & Telemetry Hub",
+    "version": "2.4.0",
+    "architecture": "Zero-Dependency WebGPU/WebGL2 + Cloud-Optimized Zarr/PMTiles Streaming Engine",
+    "computeBackend": {
+      "ingestionEngine": "HPC Real-Time Level-1/2 Swath Assimilation & Downscaling",
+      "tileServer": "Dynamic Zarr v3 Voxel Slicer + Vector PMTiles + COG (Cloud-Optimized GeoTIFF)",
+      "reprojection": "On-the-fly GPU Compute Shader (WGS84 / EPSG:4326, Web Mercator / EPSG:3857, Polar Stereographic / EPSG:3995 & EPSG:3031)"
+    }
+  },
+  "mainViewport": {
+    "type": "global_map_canvas",
+    "defaultProjection": "globe_3d_wgs84",
+    "supportedProjections": [
+      {
+        "id": "globe_3d_wgs84",
+        "label": "3D Planetary Globe (WGS84)",
+        "epsg": "EPSG:4978"
+      },
+      {
+        "id": "equirectangular_2d",
+        "label": "2D Equirectangular Plate Carree",
+        "epsg": "EPSG:4326"
+      },
+      {
+        "id": "arctic_polar_stereo",
+        "label": "Arctic Polar Stereographic",
+        "epsg": "EPSG:3995"
+      },
+      {
+        "id": "antarctic_polar_stereo",
+        "label": "Antarctic Polar Stereographic",
+        "epsg": "EPSG:3031"
+      }
+    ],
+    "cameraDefaults": {
+      "longitude": -20.0,
+      "latitude": 20.0,
+      "altitudeMeters": 14500000,
+      "pitchDegrees": 0,
+      "bearingDegrees": 0,
+      "verticalExaggeration": 15.0
+    },
+    "verticalSliceEngine": {
+      "enabled": true,
+      "atmosphericLevelsHpa": [
+        1000,
+        925,
+        850,
+        700,
+        500,
+        300,
+        250,
+        100,
+        50,
+        10
+      ],
+      "oceanDepthLevelsMeters": [
+        0,
+        10,
+        50,
+        100,
+        250,
+        500,
+        1000,
+        2000,
+        4000,
+        6000
+      ],
+      "crossSectionTransectTool": true
+    },
+    "baseMaps": [
+      {
+        "id": "bathymetry_topography_shaded",
+        "name": "GEBCO Bathymetry & FABDEM Terrain Relief",
+        "source": "GEBCO 2025 + Copernicus DEM + NOAA Coastal LiDAR",
+        "format": "pmtiles_raster_dem",
+        "default": true
+      },
+      {
+        "id": "dark_telemetry_vector",
+        "name": "Dark Scientific Telemetry Basemap",
+        "source": "OpenStreetMap + Natural Earth v5",
+        "format": "pmtiles_vector",
+        "default": false
+      },
+      {
+        "id": "viirs_nightlights_baseline",
+        "name": "VIIRS Black Marble Nighttime Lights",
+        "source": "NASA Suomi NPP / NOAA-20 VIIRS DNB",
+        "format": "cog_tiles",
+        "default": false
+      }
+    ]
+  },
+  "uiLayout": {
+    "topBar": {
+      "components": [
+        "global_anomaly_ticker",
+        "projection_switcher",
+        "ssp_scenario_selector",
+        "coordinate_search_geocoder",
+        "point_inspector_crosshair_toggle"
+      ],
+      "liveReadouts": [
+        {
+          "id": "global_2m_temp_anomaly",
+          "label": "Global 2m Temp Anomaly (vs 1850-1900)",
+          "unit": "degC",
+          "source": "ECMWF ERA5 / GISTEMP"
+        },
+        {
+          "id": "mauna_loa_co2",
+          "label": "Atmospheric CO2",
+          "unit": "ppm",
+          "source": "NOAA GML / OCO-3"
+        },
+        {
+          "id": "enso_nino34",
+          "label": "ENSO Nino 3.4 Index",
+          "unit": "degC",
+          "source": "NOAA CPC"
+        },
+        {
+          "id": "global_sst_anomaly",
+          "label": "Global SST Anomaly (60S-60N)",
+          "unit": "degC",
+          "source": "NOAA OISST v2.1"
+        }
+      ]
+    },
+    "leftSidebar": {
+      "id": "layer_tree_controller",
+      "collapsible": true,
+      "features": [
+        "multi_layer_blending_opacity",
+        "altitude_depth_slider",
+        "colormap_palette_selector",
+        "anomaly_vs_absolute_mode_toggle",
+        "raw_data_source_citation_popover"
+      ]
+    },
+    "rightDrawer": {
+      "id": "telemetry_analytics_dock",
+      "collapsible": true,
+      "panels": [
+        "point_vertical_profile_sounding_skew_t",
+        "ocean_water_column_ctd_profile",
+        "regional_time_series_chart",
+        "cmip6_ensemble_spread_boxplot",
+        "netcdf_zarr_subset_exporter"
+      ]
+    },
+    "bottomDock": {
+      "id": "temporal_dimension_controller",
+      "rangeStart": "1950-01-01T00:00:00Z",
+      "rangeEnd": "2100-12-31T23:59:59Z",
+      "modes": [
+        {
+          "id": "realtime_telemetry",
+          "label": "Live Telemetry & Nowcast (-7d to +10d)",
+          "step": "10m"
+        },
+        {
+          "id": "historical_reanalysis",
+          "label": "Historical Reanalysis (1950-Present)",
+          "step": "1d"
+        },
+        {
+          "id": "cmip_projections",
+          "label": "CMIP6/CMIP7 Projections (2026-2100)",
+          "step": "1M",
+          "scenarios": [
+            "SSP1-1.9",
+            "SSP1-2.6",
+            "SSP2-4.5",
+            "SSP3-7.0",
+            "SSP5-8.5"
+          ]
+        }
+      ]
+    }
+  },
+  "layerGroups": [
+    {
+      "groupId": "atmospheric_dynamics_meteorology",
+      "groupName": "1. Atmospheric Dynamics & Real-Time Meteorology",
+      "icon": "wind",
+      "defaultExpanded": true,
+      "layers": [
+        {
+          "id": "geo_multispectral_satellite",
+          "name": "Geostationary Multispectral Satellite Imagery",
+          "description": "16-band full-disk stitched composite (True Color, Clean IR 10.3um, Upper/Lower Water Vapor).",
+          "publicSources": [
+            "NOAA GOES-16/18 (ABI)",
+            "EUMETSAT MTG-I1",
+            "JAXA Himawari-9"
+          ],
+          "renderType": "webgl_raster_tile_shader",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "0.5 km to 2.0 km",
+          "temporalResolution": "5 to 10 minutes",
+          "verticalDimension": "cloud_top_pressure_hpa",
+          "units": "Kelvin / Reflectance",
+          "subBands": [
+            "true_color_rgb",
+            "ir_longwave_10_3um",
+            "water_vapor_upper_6_2um",
+            "water_vapor_lower_7_3um",
+            "airmass_rgb"
+          ],
+          "defaultVisible": true,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "volumetric_doppler_radar",
+          "name": "3D Volumetric Doppler Radar & Hydrometeor Classification",
+          "description": "Global composite reflectivity, radial velocity wind shear, and dual-polarization precipitation phase.",
+          "publicSources": [
+            "NOAA MRMS",
+            "NEXRAD Level-II",
+            "EUMETNET OPERA",
+            "NASA/JAXA GPM DPR"
+          ],
+          "renderType": "webgpu_3d_raymarched_volume",
+          "dataFormat": "zarr_3d_voxel",
+          "spatialResolution": "1.0 km horizontal, 250 m vertical",
+          "temporalResolution": "2 to 15 minutes",
+          "verticalDimension": "altitude_meters_msl",
+          "units": "dBZ / mm/hr / m/s",
+          "subBands": [
+            "base_reflectivity_dbz",
+            "composite_reflectivity",
+            "precip_type_hydrometeor",
+            "radial_velocity_shear",
+            "echo_tops_km"
+          ],
+          "defaultVisible": true,
+          "defaultOpacity": 0.85
+        },
+        {
+          "id": "synoptic_fronts_isobars",
+          "name": "Synoptic Fronts & Isobaric Topology",
+          "description": "Automated frontal boundaries (cold, warm, occluded, stationary, drylines) and mean sea-level pressure contours.",
+          "publicSources": [
+            "NOAA WPC Coded Surface Fronts",
+            "ECMWF ERA5",
+            "NOAA GFS"
+          ],
+          "renderType": "vector_pmtiles_styled_lines",
+          "dataFormat": "pmtiles_vector",
+          "spatialResolution": "0.25 degrees (25 km)",
+          "temporalResolution": "1 hour",
+          "verticalDimension": "surface_mslp",
+          "units": "hPa",
+          "defaultVisible": true,
+          "defaultOpacity": 1.0
+        },
+        {
+          "id": "wind_vector_jet_streams",
+          "name": "3D Wind Vector Fields, Jet Streams & CAPE",
+          "description": "Animated Lagrangian particle streamlines from surface (10m) to polar vortex (10 hPa) with convective instability overlay.",
+          "publicSources": [
+            "ECMWF IFS / ERA5",
+            "NOAA GFS / HRRR"
+          ],
+          "renderType": "webgl_gpu_particle_advection",
+          "dataFormat": "zarr_uv_vector_grid",
+          "spatialResolution": "3 km (HRRR) to 25 km (Global)",
+          "temporalResolution": "1 hour",
+          "verticalDimension": "isobaric_hpa",
+          "selectablePressureLevelsHpa": [
+            1000,
+            850,
+            700,
+            500,
+            250,
+            100,
+            10
+          ],
+          "units": "m/s (Wind) / J/kg (CAPE)",
+          "defaultVisible": true,
+          "defaultOpacity": 0.65
+        },
+        {
+          "id": "atmospheric_rivers_ivt",
+          "name": "Atmospheric Rivers & Integrated Vapor Transport (IVT)",
+          "description": "Corridors of concentrated horizontal water vapor flux categorized on the Ralph et al. AR1-AR5 scale.",
+          "publicSources": [
+            "CW3E Scripps AR Catalog",
+            "NASA MERRA-2",
+            "NOAA GFS"
+          ],
+          "renderType": "shader_scalar_contour_plus_vectors",
+          "dataFormat": "zarr_2d_grid",
+          "spatialResolution": "0.25 degrees",
+          "temporalResolution": "3 hours",
+          "verticalDimension": "integrated_column_1000_to_300hpa",
+          "units": "kg m-1 s-1",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        },
+        {
+          "id": "global_lightning_telemetry",
+          "name": "Global Optical & RF Lightning Flash Density",
+          "description": "Real-time total lightning (intra-cloud and cloud-to-ground) flash extent density and energy.",
+          "publicSources": [
+            "NOAA GOES-R GLM",
+            "EUMETSAT MTG Lightning Imager",
+            "NASA ISS LIS"
+          ],
+          "renderType": "point_cloud_heatmap_decay",
+          "dataFormat": "geojson_stream_websocket",
+          "spatialResolution": "2 km to 8 km",
+          "temporalResolution": "20 seconds",
+          "verticalDimension": "cloud_column",
+          "units": "flashes km-2 min-1",
+          "defaultVisible": false,
+          "defaultOpacity": 0.9
+        }
+      ]
+    },
+    {
+      "groupId": "trace_gases_aerosols_radiation",
+      "groupName": "2. Trace Gases, Aerosols & Radiative Forcing",
+      "icon": "molecule",
+      "defaultExpanded": false,
+      "layers": [
+        {
+          "id": "column_co2_flux",
+          "name": "Column-Averaged Carbon Dioxide (XCO2) & Surface Flux",
+          "description": "Global CO2 concentration swaths, seasonal biosphere drawdown, and fossil fuel emission anomalies.",
+          "publicSources": [
+            "NASA OCO-2 / OCO-3",
+            "JAXA GOSAT-2",
+            "NOAA GML CarbonTracker"
+          ],
+          "renderType": "webgl_raster_grid_plus_station_pins",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "1.3 km x 2.25 km (swath) / 1 deg (assimilated)",
+          "temporalResolution": "Daily / Monthly",
+          "verticalDimension": "total_atmospheric_column",
+          "units": "ppm / gC m-2 day-1",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "methane_plumes_background",
+          "name": "Methane (CH4) Super-Emitter Plumes & Background",
+          "description": "Dual-scale layer combining planetary CH4 distribution with 30m-to-60m facility-level point-source plume polygons.",
+          "publicSources": [
+            "ESA Sentinel-5P TROPOMI",
+            "NASA EMIT",
+            "CarbonMapper (Tanager)",
+            "MethaneSAT"
+          ],
+          "renderType": "hybrid_raster_plus_highres_plume_polygons",
+          "dataFormat": "zarr_plus_pmtiles",
+          "spatialResolution": "5.5 km (Global TROPOMI) / 30 m (EMIT Plumes)",
+          "temporalResolution": "Daily",
+          "verticalDimension": "total_column_ppb",
+          "units": "ppb (Background) / kg CH4 hr-1 (Plume Flux)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.85
+        },
+        {
+          "id": "tropospheric_no2_so2",
+          "name": "Tropospheric NO2, SO2 & Formaldehyde (HCHO)",
+          "description": "Hourly diurnal urban traffic, power plant, shipping lane, and volcanic degassing combustion plumes.",
+          "publicSources": [
+            "NASA TEMPO",
+            "ESA Sentinel-5P TROPOMI",
+            "NIER GEMS"
+          ],
+          "renderType": "webgl_raster_tile_shader",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "2 km x 4.75 km (TEMPO) / 3.5 km x 5.5 km (TROPOMI)",
+          "temporalResolution": "1 hour (daylight) / Daily",
+          "verticalDimension": "tropospheric_column",
+          "units": "molecules cm-2",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "aerosol_optical_depth_speciated",
+          "name": "Speciated Aerosols (AOD, PM2.5, Black Carbon, Dust, Sulfate)",
+          "description": "Atmospheric particulate tracking separating wildfire smoke, Saharan mineral dust, sea salt, and industrial sulfates.",
+          "publicSources": [
+            "Copernicus CAMS",
+            "NASA MODIS/VIIRS",
+            "NASA GEOS-FP",
+            "OpenAQ Ground Stations"
+          ],
+          "renderType": "webgl_particle_smoke_shader_plus_pins",
+          "dataFormat": "zarr_2d_multiband",
+          "spatialResolution": "0.1 degrees (10 km)",
+          "temporalResolution": "1 to 3 hours",
+          "verticalDimension": "surface_pm25_and_total_aod_550nm",
+          "units": "ug m-3 (PM2.5) / Dimensionless (AOD)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.7
+        },
+        {
+          "id": "toa_radiative_energy_budget",
+          "name": "Top-of-Atmosphere (TOA) Radiative Energy Imbalance & Albedo",
+          "description": "Net planetary energy imbalance: incoming solar irradiance minus reflected shortwave and emitted outgoing longwave radiation.",
+          "publicSources": [
+            "NASA CERES (Terra/Aqua/NOAA-20)",
+            "DSCOVR EPIC/NISTAR"
+          ],
+          "renderType": "webgl_diverging_heatmap",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "1.0 degree",
+          "temporalResolution": "Daily / Monthly",
+          "verticalDimension": "top_of_atmosphere",
+          "units": "W m-2",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        }
+      ]
+    },
+    {
+      "groupId": "physical_biogeochemical_oceanography",
+      "groupName": "3. Physical & Biogeochemical Oceanography",
+      "icon": "waves",
+      "defaultExpanded": false,
+      "layers": [
+        {
+          "id": "sst_marine_heatwaves",
+          "name": "Sea Surface Temperature (SST), Anomalies & Marine Heatwaves",
+          "description": "Gap-free foundation SST, 1981-2010 baseline anomalies, and categorized Marine Heatwave (MHW Category I-IV) polygons.",
+          "publicSources": [
+            "NOAA CoralTemp",
+            "NOAA OISST v2.1",
+            "ESA Sentinel-3 SLSTR",
+            "GHRSST MUR (1km)"
+          ],
+          "renderType": "webgl_raster_plus_contour_polygons",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "1 km (MUR) to 25 km (OISST)",
+          "temporalResolution": "Daily",
+          "verticalDimension": "sea_surface_skin",
+          "units": "degC",
+          "defaultVisible": false,
+          "defaultOpacity": 0.85
+        },
+        {
+          "id": "subsurface_ocean_heat_salinity_3d",
+          "name": "3D Subsurface Ocean Heat Content (OHC) & Halocline Profiles",
+          "description": "Volumetric ocean temperature and salinity down to 6,000m assimilated with live profiling Argo floats.",
+          "publicSources": [
+            "International Argo Array (Core, Deep, BGC)",
+            "NOAA NCEI",
+            "Copernicus GLORYS12"
+          ],
+          "renderType": "webgpu_3d_ocean_voxel_plus_float_trajectories",
+          "dataFormat": "zarr_3d_voxel_plus_parquet_points",
+          "spatialResolution": "0.083 degrees (9 km) grid + discrete Lagrangian floats",
+          "temporalResolution": "Daily (Grid) / 10-day cycle (Floats)",
+          "verticalDimension": "depth_meters_0_to_6000",
+          "units": "Zettajoules / J m-2 / PSU (Salinity)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        },
+        {
+          "id": "thermohaline_currents_amoc",
+          "name": "Ocean Surface Currents, Mesoscale Eddies & AMOC Transport",
+          "description": "Geostrophic and Ekman current streamlines, Gulf Stream warm/cold core rings, and RAPID 26.5N overturning array.",
+          "publicSources": [
+            "NASA OSCAR",
+            "Navy HYCOM",
+            "Copernicus CMEMS",
+            "RAPID-AMOC Array"
+          ],
+          "renderType": "webgl_gpu_particle_advection",
+          "dataFormat": "zarr_uv_vector_grid",
+          "spatialResolution": "0.08 degrees (8 km)",
+          "temporalResolution": "3 hours to Daily",
+          "verticalDimension": "depth_meters",
+          "units": "m/s (Velocity) / Sverdrups (AMOC)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        },
+        {
+          "id": "swot_sea_surface_height_altimetry",
+          "name": "Sea Surface Height (SSH), Steric/Barystatic Rise & SWOT Altimetry",
+          "description": "High-resolution 2D swath altimetry resolving sub-mesoscale eddies, coastal sea level anomalies, and tide gauge records.",
+          "publicSources": [
+            "NASA/CNES SWOT",
+            "Sentinel-6 Michael Freilich",
+            "PSMSL Tide Gauges"
+          ],
+          "renderType": "webgl_raster_relief_shader",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "2 km (SWOT swath) / 25 km (Global gridded)",
+          "temporalResolution": "Daily / 21-day cycle",
+          "verticalDimension": "sea_surface_geoid_offset",
+          "units": "mm / cm",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "ocean_acidification_carbonate",
+          "name": "Ocean Acidification (pH), pCO2 & Aragonite/Calcite Saturation",
+          "description": "Surface and subsurface carbonate chemistry tracking corrosive undersaturation thresholds for calcifying marine taxa.",
+          "publicSources": [
+            "SOCAT (Surface Ocean CO2 Atlas)",
+            "GLODAP",
+            "BGC-Argo",
+            "Copernicus Marine Biogeochemistry"
+          ],
+          "renderType": "webgl_raster_plus_contour_isolines",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "0.25 degrees",
+          "temporalResolution": "Monthly",
+          "verticalDimension": "depth_meters",
+          "units": "pH (Total Scale) / Omega_Aragonite",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "marine_chlorophyll_hypoxia",
+          "name": "Hyperspectral Phytoplankton, Chlorophyll-a & Hypoxic Dead Zones",
+          "description": "Phytoplankton functional group speciation, harmful algal blooms (HABs), and subsurface dissolved oxygen depletion.",
+          "publicSources": [
+            "NASA PACE (OCI Hyperspectral)",
+            "MODIS-Aqua / Sentinel-3 OLCI",
+            "World Ocean Atlas (Dissolved O2)"
+          ],
+          "renderType": "webgl_raster_multiband",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "1 km (PACE/OLCI)",
+          "temporalResolution": "Daily",
+          "verticalDimension": "photic_zone_and_benthic_o2",
+          "units": "mg m-3 (Chl-a) / umol kg-1 (O2)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        },
+        {
+          "id": "teleconnection_oscillation_masks",
+          "name": "Teleconnection Basin Masks (ENSO, PDO, IOD, AMO, NAO)",
+          "description": "Interactive spatial bounding regions and anomaly phase readouts for major coupled ocean-atmosphere oscillations.",
+          "publicSources": [
+            "NOAA Climate Prediction Center (CPC)",
+            "JAMSTEC",
+            "NCAR Climate Data Guide"
+          ],
+          "renderType": "vector_bounding_polygons_with_hud",
+          "dataFormat": "geojson_static_plus_api_timeseries",
+          "spatialResolution": "Basin-scale",
+          "temporalResolution": "Weekly / Monthly",
+          "verticalDimension": "surface",
+          "units": "Standardized Index / degC Anomaly",
+          "defaultVisible": false,
+          "defaultOpacity": 0.6
+        }
+      ]
+    },
+    {
+      "groupId": "cryosphere_glacial_mass_balance",
+      "groupName": "4. Cryosphere & Glacial Mass Balance",
+      "icon": "snowflake",
+      "defaultExpanded": false,
+      "layers": [
+        {
+          "id": "sea_ice_concentration_drift",
+          "name": "Sea Ice Extent, Concentration, Polynyas & Drift Vectors",
+          "description": "Daily polar microwave sea ice percentage, median 1981-2010 contour line, and SAR-derived ice floe kinematics.",
+          "publicSources": [
+            "NSIDC Passive Microwave (SSMI/S)",
+            "JAXA AMSR2",
+            "ESA Sentinel-1 SAR Drift"
+          ],
+          "renderType": "webgl_raster_plus_median_contour_and_vectors",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "3.125 km (AMSR2) to 25 km (NSIDC)",
+          "temporalResolution": "Daily",
+          "verticalDimension": "sea_surface",
+          "units": "Percent (%) / cm s-1",
+          "defaultVisible": false,
+          "defaultOpacity": 0.9
+        },
+        {
+          "id": "sea_ice_thickness_freeboard_age",
+          "name": "Sea Ice Thickness, Freeboard & Multi-Year Ice Age",
+          "description": "Volumetric sea ice thickness combining photon-counting laser and radar altimetry with ice age tracking (1st year vs 4+ year ice).",
+          "publicSources": [
+            "NASA ICESat-2 (ATLAS)",
+            "ESA CryoSat-2",
+            "UW PIOMAS",
+            "NSIDC Sea Ice Age"
+          ],
+          "renderType": "webgl_raster_tile_shader",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "5 km to 25 km",
+          "temporalResolution": "Weekly / Monthly",
+          "verticalDimension": "ice_draft_and_freeboard_meters",
+          "units": "Meters (m) / Years",
+          "defaultVisible": false,
+          "defaultOpacity": 0.85
+        },
+        {
+          "id": "gravimetric_ice_sheet_mass_balance",
+          "name": "Greenland & Antarctic Gravimetric Mass Balance & Grounding Lines",
+          "description": "Equivalent water thickness mass anomalies, sub-shelf basal melt rates, and grounding-zone migration.",
+          "publicSources": [
+            "NASA/GFZ GRACE-FO",
+            "IMBIE",
+            "MEaSUREs Antarctic Boundaries"
+          ],
+          "renderType": "webgl_diverging_heatmap_plus_vector_grounding_lines",
+          "dataFormat": "zarr_plus_pmtiles",
+          "spatialResolution": "25 km (Altimetry) to 300 km (Gravimetry)",
+          "temporalResolution": "Monthly",
+          "verticalDimension": "ice_sheet_column",
+          "units": "cm Equivalent Water Height / Gt yr-1",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        },
+        {
+          "id": "alpine_glacier_velocity_rgi",
+          "name": "Global Mountain Glacier Outlines, Flow Velocity & Elevation Change",
+          "description": "215,000+ glacier polygons with optical/radar feature-tracked surface ice velocity and geodetic mass balance.",
+          "publicSources": [
+            "NASA ITS_LIVE",
+            "Randolph Glacier Inventory (RGI 7.0)",
+            "GLIMS",
+            "WGMS"
+          ],
+          "renderType": "vector_pmtiles_plus_velocity_raster",
+          "dataFormat": "pmtiles_plus_zarr",
+          "spatialResolution": "120 m (ITS_LIVE velocity) + Exact Vector Outlines",
+          "temporalResolution": "Seasonal / Annual",
+          "verticalDimension": "terrain_surface",
+          "units": "m yr-1 (Velocity) / m w.e. yr-1 (Mass Balance)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.85
+        },
+        {
+          "id": "permafrost_thermokarst_subsidence",
+          "name": "Permafrost Probability, Active Layer Thickness & InSAR Subsidence",
+          "description": "Ground thermal regime, seasonal thaw depth, borehole temperatures, and retrogressive thaw slump deformation.",
+          "publicSources": [
+            "ESA CCI Permafrost",
+            "GTN-P Boreholes",
+            "Sentinel-1 InSAR",
+            "NASA SMAP Freeze/Thaw"
+          ],
+          "renderType": "webgl_raster_plus_borehole_pins",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "1 km (CCI) / 9 km (SMAP)",
+          "temporalResolution": "Daily (Freeze/Thaw) / Annual (Active Layer)",
+          "verticalDimension": "subsurface_0_to_20m",
+          "units": "Meters (Thaw Depth) / degC (Ground Temp)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        }
+      ]
+    },
+    {
+      "groupId": "terrestrial_biosphere_hydrology_carbon",
+      "groupName": "5. Terrestrial Biosphere, Hydrology & Carbon Sinks",
+      "icon": "trees",
+      "defaultExpanded": false,
+      "layers": [
+        {
+          "id": "canopy_height_aboveground_biomass",
+          "name": "3D Forest Canopy Height & Aboveground Biomass Carbon Density",
+          "description": "Spaceborne waveform LiDAR and P-band SAR estimates of forest vertical structure and stored woody carbon.",
+          "publicSources": [
+            "NASA GEDI (ISS)",
+            "ESA BIOMASS",
+            "ESA CCI Biomass",
+            "Sentinel-2 / Landsat Harmonized"
+          ],
+          "renderType": "webgl_raster_extrusion_3d",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "25 m (GEDI footprints) / 100 m (Global Biomass)",
+          "temporalResolution": "Annual / Quarterly",
+          "verticalDimension": "canopy_height_meters",
+          "units": "Mg C ha-1 (Biomass) / Meters (Height)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        },
+        {
+          "id": "sif_photosynthesis_evaporative_stress",
+          "name": "Solar-Induced Fluorescence (SIF), GPP & Canopy Evaporative Stress",
+          "description": "Direct photosynthetic activity proxy paired with thermal infrared plant water stress prior to visible leaf browning.",
+          "publicSources": [
+            "NASA ECOSTRESS (ISS)",
+            "OCO-2/3 SIF",
+            "Sentinel-5P TROPOMI SIF",
+            "MODIS NDVI/EVI"
+          ],
+          "renderType": "webgl_raster_tile_shader",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "70 m (ECOSTRESS) to 5 km (SIF)",
+          "temporalResolution": "Daily to 8-day composite",
+          "verticalDimension": "vegetation_canopy",
+          "units": "mW m-2 sr-1 nm-1 (SIF) / ESI Index (-3 to +3)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "soil_moisture_groundwater_grace",
+          "name": "Root-Zone Soil Moisture & Deep Aquifer Groundwater Anomalies",
+          "description": "L-band radiometer surface/root-zone moisture paired with gravimetric terrestrial water storage depletion in major aquifers.",
+          "publicSources": [
+            "NASA SMAP",
+            "NASA/DLR GRACE-FO",
+            "NASA GLDAS",
+            "USGS / Global Groundwater Monitoring Network"
+          ],
+          "renderType": "webgl_dual_scale_raster",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "9 km (SMAP) / 100 km (GRACE-FO)",
+          "temporalResolution": "3-day (SMAP) / Monthly (GRACE-FO)",
+          "verticalDimension": "root_zone_1m_and_aquifer_storage",
+          "units": "m3 m-3 (Volumetric Moisture) / cm Equivalent Water",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "swot_surface_water_river_discharge",
+          "name": "Global River Discharge, Reservoir Volume & Flood Inundation",
+          "description": "High-resolution water mask polygons, river slope/discharge estimates, and active SAR flood inundation mapping.",
+          "publicSources": [
+            "NASA/CNES SWOT Hydrology",
+            "JRC Global Surface Water",
+            "Copernicus GloFAS",
+            "Sentinel-1 SAR Floods"
+          ],
+          "renderType": "vector_water_polygons_plus_hydrograph_nodes",
+          "dataFormat": "pmtiles_vector_plus_timeseries",
+          "spatialResolution": "10 m to 100 m",
+          "temporalResolution": "Daily",
+          "verticalDimension": "water_surface_elevation_m",
+          "units": "m3 s-1 (Discharge) / km3 (Volume)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.85
+        },
+        {
+          "id": "active_wildfires_frp_burn_severity",
+          "name": "Active Fire Radiative Power (FRP), Burn Scars (dNBR) & Carbon Emissions",
+          "description": "Real-time thermal anomalies, fire perimeter progression, post-fire burn severity, and biomass combustion CO2/CO release.",
+          "publicSources": [
+            "NASA FIRMS (VIIRS 375m / MODIS)",
+            "GOES ABI Fire",
+            "GFED5",
+            "MTBS / Sentinel-2 dNBR"
+          ],
+          "renderType": "point_glow_shader_plus_perimeter_polygons",
+          "dataFormat": "geojson_stream_plus_pmtiles",
+          "spatialResolution": "375 m (VIIRS) / 20 m (Sentinel-2 Burn Scar)",
+          "temporalResolution": "15 minutes (GOES) to 12 hours (VIIRS)",
+          "verticalDimension": "surface_and_plume_injection_height",
+          "units": "Megawatts (FRP) / dNBR Index",
+          "defaultVisible": false,
+          "defaultOpacity": 0.9
+        },
+        {
+          "id": "dynamic_land_cover_deforestation",
+          "name": "10m Near-Real-Time Land Cover, Deforestation & Peatland/Mangrove Loss",
+          "description": "Deep-learning land use probabilities tracking tropical canopy disturbance, agricultural encroachment, and coastal blue carbon.",
+          "publicSources": [
+            "Dynamic World (Google/WRI Sentinel-2)",
+            "GLAD / UMD Forest Loss",
+            "Global Mangrove Watch"
+          ],
+          "renderType": "webgl_categorical_raster",
+          "dataFormat": "cog_tiles",
+          "spatialResolution": "10 meters",
+          "temporalResolution": "5 days (Sentinel-2 revisit)",
+          "verticalDimension": "surface",
+          "units": "Categorical Class / Alert Confidence",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        }
+      ]
+    },
+    {
+      "groupId": "climate_risk_attribution_projections",
+      "groupName": "6. Climate Risk, Extreme Attribution & CMIP Projections",
+      "icon": "shield-alert",
+      "defaultExpanded": false,
+      "layers": [
+        {
+          "id": "cmip6_downscaled_ensemble",
+          "name": "CMIP6 / CMIP7 Downscaled Multi-Model Projections (SSP1 to SSP5)",
+          "description": "Bias-corrected, spatially downscaled climate model ensemble medians and 10th-90th percentile spread through 2100.",
+          "publicSources": [
+            "NASA NEX-GDDP-CMIP6",
+            "WCRP CORDEX",
+            "Copernicus CDS"
+          ],
+          "renderType": "webgl_parametric_scenario_shader",
+          "dataFormat": "zarr_4d_scenario_cube",
+          "spatialResolution": "0.1 to 0.25 degrees (10 km to 25 km)",
+          "temporalResolution": "Daily / Monthly / Decadal (1950-2100)",
+          "verticalDimension": "surface_2m",
+          "subVariables": [
+            "tasmax_extreme_heat",
+            "pr_precipitation_anomaly",
+            "cdd_consecutive_dry_days",
+            "rx5day_extreme_rainfall"
+          ],
+          "units": "degC / mm day-1 / Days",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "wet_bulb_globe_temp_heat_stress",
+          "name": "Wet-Bulb Globe Temperature (WBGT) & Human Survivability Thresholds",
+          "description": "Combined heat-humidity physiological stress index flagging ISO labor limits and the 35C theoretical human thermoregulatory limit.",
+          "publicSources": [
+            "ECMWF ERA5-HEAT",
+            "NOAA HeatRisk / NDFD",
+            "CMIP6 Derived WBGT"
+          ],
+          "renderType": "webgl_threshold_contour_shader",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "9 km to 25 km",
+          "temporalResolution": "1 hour (Historical/Forecast) / Daily (Projected)",
+          "verticalDimension": "surface_2m",
+          "units": "degC (WBGT / Tw)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.8
+        },
+        {
+          "id": "coastal_inundation_storm_surge",
+          "name": "Dynamic Coastal Sea-Level Inundation & Return-Period Storm Surge",
+          "description": "Bathtub and hydrodynamic coastal flood modeling combining SLR projections (0.5m to 3.0m) with 1-in-100-year storm surge.",
+          "publicSources": [
+            "NOAA Sea Level Rise Viewer DEMs",
+            "Deltares Global Tide and Surge Model (GTSM)",
+            "FABDEM / ICESat-2 Coastal"
+          ],
+          "renderType": "webgl_water_level_flood_shader",
+          "dataFormat": "cog_dem_tiles",
+          "spatialResolution": "3 m (US Coastal LiDAR) to 30 m (Global FABDEM)",
+          "temporalResolution": "Interactive Slider (SLR + Surge Height)",
+          "verticalDimension": "elevation_meters_navd88_egm2008",
+          "units": "Meters above MHHW",
+          "defaultVisible": false,
+          "defaultOpacity": 0.85
+        },
+        {
+          "id": "compound_hazard_fire_weather_index",
+          "name": "Compound Hazard Index & Canadian Forest Fire Weather Index (FWI)",
+          "description": "Multivariate risk layer identifying concurrent extremes: hot-dry-windy fire weather, rain-on-snow flood risk, and sequential cyclone-heat cascades.",
+          "publicSources": [
+            "Copernicus GWIS (Global Wildfire Information System)",
+            "NOAA NCEP",
+            "WCRP Compound Extremes Atlas"
+          ],
+          "renderType": "webgl_bivariate_choropleth_raster",
+          "dataFormat": "cloud_optimized_zarr",
+          "spatialResolution": "8 km to 25 km",
+          "temporalResolution": "Daily",
+          "verticalDimension": "surface",
+          "units": "FWI Dimensionless Index (0-100+)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.75
+        },
+        {
+          "id": "critical_infrastructure_socioeconomic_exposure",
+          "name": "Critical Infrastructure, Agro-Ecological Yield Shifts & Social Vulnerability",
+          "description": "Vector overlay of power grids, substations, desalination plants, ports, and hospitals intersected with population vulnerability and crop viability.",
+          "publicSources": [
+            "OpenStreetMap / OpenInfraMap",
+            "NASA SEDAC GPWv4",
+            "FEMA NRI / CDC SVI",
+            "FAO GAEZ v4 Crop Suitability"
+          ],
+          "renderType": "vector_pmtiles_plus_extruded_3d_nodes",
+          "dataFormat": "pmtiles_vector",
+          "spatialResolution": "Exact Vector Geometry + 1 km Population Grid",
+          "temporalResolution": "Annual / Decadal",
+          "verticalDimension": "surface_infrastructure",
+          "units": "Risk Score (0-100) / Megawatts / Yield Delta (%)",
+          "defaultVisible": false,
+          "defaultOpacity": 0.9
+        }
+      ]
+    }
+  ]
+}
