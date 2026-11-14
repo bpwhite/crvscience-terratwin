@@ -324,7 +324,7 @@ fn run_daemon_loop(
         sim_secs,
         cfg.scenario.code()
     );
-    let coord = BackgroundCoordinator::new(schema, db, cfg);
+    let coord = BackgroundCoordinator::new(schema, db, cfg.clone());
     let workers = coord.spawn_background_workers(
         Duration::from_secs(ingest_secs.max(5)),
         Duration::from_secs(sim_secs.max(2)),

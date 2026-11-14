@@ -250,7 +250,7 @@ pub fn semi_lagrangian_advect_qmsl(
                 }
 
                 let mut lat_m = lat_a;
-                let mut lon_m = lon_a;
+                let mut lon_m;
                 for _ in 0..2 {
                     let cos_phi = lat_m.to_radians().cos().max(0.14);
                     let dlat_deg = ((v_mid * 0.5 * dt_secs) / EARTH_RADIUS_M).to_degrees();

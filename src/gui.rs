@@ -1019,13 +1019,13 @@ impl TerraTwinGuiApp {
                     painter.circle_stroke(
                         rect.center(),
                         r_px,
-                        Stroke::new(2.0, Color32::from_rgba_unmultiplied(90, 195, 255, 130)),
+                        Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(90, 195, 255, 130)),
                     );
                 }
 
                 // Graticule (30 deg parallels & meridians)
                 let grat_stroke =
-                    Stroke::new(0.6, Color32::from_rgba_unmultiplied(180, 210, 240, 38));
+                    Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(180, 210, 240, 38));
                 for lat_g in (-60..=60).step_by(30) {
                     let mut prev: Option<Pos2> = None;
                     for lon_g in (-180..=180).step_by(6) {
@@ -1075,7 +1075,7 @@ impl TerraTwinGuiApp {
 
                 // Vector Continental Coastlines
                 let coast_stroke =
-                    Stroke::new(1.25, Color32::from_rgba_unmultiplied(215, 232, 248, 175));
+                    Stroke::new(1.25_f32, Color32::from_rgba_unmultiplied(215, 232, 248, 175));
                 for poly in CONTINENT_POLYLINES {
                     let mut prev: Option<Pos2> = None;
                     for &(lat, lon) in *poly {
@@ -1107,7 +1107,7 @@ impl TerraTwinGuiApp {
                     .map(|s| s.visible)
                     .unwrap_or(false)
                 {
-                    let mask_stroke = Stroke::new(1.6, Color32::from_rgb(255, 215, 85));
+                    let mask_stroke = Stroke::new(1.6_f32, Color32::from_rgb(255, 215, 85));
                     for &(_, label, min_la, max_la, min_lo, max_lo) in TELECONNECTION_BASINS {
                         let corners = [
                             (min_la, min_lo),
@@ -1160,9 +1160,9 @@ impl TerraTwinGuiApp {
                     .unwrap_or(false)
                 {
                     let iso_thin =
-                        Stroke::new(0.95, Color32::from_rgba_unmultiplied(235, 244, 255, 145));
+                        Stroke::new(0.95_f32, Color32::from_rgba_unmultiplied(235, 244, 255, 145));
                     let iso_major =
-                        Stroke::new(1.75, Color32::from_rgba_unmultiplied(255, 255, 255, 205));
+                        Stroke::new(1.75_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 205));
                     for seg in &self.cached_isobars {
                         if let (Some((nx1, ny1)), Some((nx2, ny2))) = (
                             project_latlon_to_ndc(
@@ -1196,9 +1196,9 @@ impl TerraTwinGuiApp {
                     }
 
                     let cold_stroke =
-                        Stroke::new(2.1, Color32::from_rgba_unmultiplied(70, 175, 255, 225));
+                        Stroke::new(2.1_f32, Color32::from_rgba_unmultiplied(70, 175, 255, 225));
                     let warm_stroke =
-                        Stroke::new(2.1, Color32::from_rgba_unmultiplied(255, 90, 75, 225));
+                        Stroke::new(2.1_f32, Color32::from_rgba_unmultiplied(255, 90, 75, 225));
                     for fseg in &self.cached_fronts {
                         if let (Some((nx1, ny1)), Some((nx2, ny2))) = (
                             project_latlon_to_ndc(
@@ -1322,7 +1322,7 @@ impl TerraTwinGuiApp {
                         aspect,
                     ) {
                         let pt = ndc_to_screen(nx, ny);
-                        let ch_stroke = Stroke::new(1.5, Color32::from_rgb(255, 95, 95));
+                        let ch_stroke = Stroke::new(1.5_f32, Color32::from_rgb(255, 95, 95));
                         painter.circle_stroke(pt, 7.5, ch_stroke);
                         painter.line_segment(
                             [egui::pos2(pt.x - 12.0, pt.y), egui::pos2(pt.x + 12.0, pt.y)],
@@ -1345,7 +1345,7 @@ impl TerraTwinGuiApp {
                     ) {
                         let pa = ndc_to_screen(ax, ay);
                         let pb = ndc_to_screen(bx, by);
-                        painter.line_segment([pa, pb], Stroke::new(2.4, Color32::from_rgb(255, 210, 60)));
+                        painter.line_segment([pa, pb], Stroke::new(2.4_f32, Color32::from_rgb(255, 210, 60)));
                         painter.circle_filled(pa, 4.5, Color32::from_rgb(255, 210, 60));
                         painter.circle_filled(pb, 4.5, Color32::from_rgb(255, 140, 60));
                     }
@@ -1457,7 +1457,7 @@ fn draw_sounding_canvas(ui: &mut egui::Ui, sounding: &[(f64, f64, f64, f64)]) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 145.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 20, 32));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_rgb(42, 56, 78)));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(42, 56, 78)));
 
     let map_pt = |p_hpa: f64, temp_c: f64| -> Pos2 {
         let y_frac = ((1000.0_f64.ln() - p_hpa.ln()) / (1000.0_f64.ln() - 10.0_f64.ln()))
@@ -1474,11 +1474,11 @@ fn draw_sounding_canvas(ui: &mut egui::Ui, sounding: &[(f64, f64, f64, f64)]) {
         let (p1, t1, td1, _) = win[1];
         painter.line_segment(
             [map_pt(p0, t0), map_pt(p1, t1)],
-            Stroke::new(2.0, Color32::from_rgb(250, 95, 85)),
+            Stroke::new(2.0_f32, Color32::from_rgb(250, 95, 85)),
         );
         painter.line_segment(
             [map_pt(p0, td0), map_pt(p1, td1)],
-            Stroke::new(1.6, Color32::from_rgb(85, 205, 250)),
+            Stroke::new(1.6_f32, Color32::from_rgb(85, 205, 250)),
         );
     }
     painter.text(
@@ -1494,7 +1494,7 @@ fn draw_ctd_canvas(ui: &mut egui::Ui, ctd: &[(f64, f64, f64)]) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 135.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(12, 22, 36));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_rgb(42, 56, 78)));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(42, 56, 78)));
 
     let map_temp = |z_m: f64, t_c: f64| -> Pos2 {
         let y_frac = (z_m / 6000.0).clamp(0.0, 1.0) as f32;
@@ -1518,11 +1518,11 @@ fn draw_ctd_canvas(ui: &mut egui::Ui, ctd: &[(f64, f64, f64)]) {
         let (z1, t1, s1) = win[1];
         painter.line_segment(
             [map_temp(z0, t0), map_temp(z1, t1)],
-            Stroke::new(2.0, Color32::from_rgb(255, 165, 70)),
+            Stroke::new(2.0_f32, Color32::from_rgb(255, 165, 70)),
         );
         painter.line_segment(
             [map_sal(z0, s0), map_sal(z1, s1)],
-            Stroke::new(1.6, Color32::from_rgb(100, 235, 190)),
+            Stroke::new(1.6_f32, Color32::from_rgb(100, 235, 190)),
         );
     }
     painter.text(
@@ -1538,7 +1538,7 @@ fn draw_cmip6_projection_canvas(ui: &mut egui::Ui, active_ssp: SspScenario, cur_
     let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 145.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 20, 32));
-    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, Color32::from_rgb(42, 56, 78)));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(42, 56, 78)));
 
     let map_yr_co2 = |yr: f64, ppm: f64| -> Pos2 {
         let xf = ((yr - 1950.0) / 150.0).clamp(0.0, 1.0) as f32;
@@ -1558,7 +1558,7 @@ fn draw_cmip6_projection_canvas(ui: &mut egui::Ui, active_ssp: SspScenario, cur_
             SspScenario::Ssp3_70 => Color32::from_rgb(245, 130, 70),
             SspScenario::Ssp5_85 => Color32::from_rgb(235, 65, 75),
         };
-        let stroke = Stroke::new(if is_sel { 2.4 } else { 1.0 }, col);
+        let stroke = Stroke::new(if is_sel { 2.4_f32 } else { 1.0_f32 }, col);
         let mut prev: Option<Pos2> = None;
         for yr_step in (1950..=2100).step_by(5) {
             let yr = yr_step as f64;
@@ -1577,7 +1577,7 @@ fn draw_cmip6_projection_canvas(ui: &mut egui::Ui, active_ssp: SspScenario, cur_
             egui::pos2(x_cur, rect.top() + 14.0),
             egui::pos2(x_cur, rect.bottom() - 8.0),
         ],
-        Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
+        Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
     );
 
     // 2100 Ensemble Spread Boxplot bar on right margin
@@ -1587,13 +1587,13 @@ fn draw_cmip6_projection_canvas(ui: &mut egui::Ui, active_ssp: SspScenario, cur_
     let p50 = map_yr_co2(2100.0, SspScenario::Ssp2_45.co2_ppm_at_year(2100.0)).y;
     let p75 = map_yr_co2(2100.0, SspScenario::Ssp3_70.co2_ppm_at_year(2100.0)).y;
     let p90 = map_yr_co2(2100.0, SspScenario::Ssp5_85.co2_ppm_at_year(2100.0)).y;
-    painter.line_segment([egui::pos2(bx, p90), egui::pos2(bx, p10)], Stroke::new(1.5, Color32::LIGHT_GRAY));
+    painter.line_segment([egui::pos2(bx, p90), egui::pos2(bx, p10)], Stroke::new(1.5_f32, Color32::LIGHT_GRAY));
     let box_rect = Rect::from_min_max(egui::pos2(bx - 8.0, p75), egui::pos2(bx + 8.0, p25));
     painter.rect_filled(box_rect, 2.0, Color32::from_rgba_unmultiplied(90, 175, 245, 120));
-    painter.rect_stroke(box_rect, 2.0, Stroke::new(1.2, Color32::WHITE));
+    painter.rect_stroke(box_rect, 2.0, Stroke::new(1.2_f32, Color32::WHITE));
     painter.line_segment(
         [egui::pos2(bx - 8.0, p50), egui::pos2(bx + 8.0, p50)],
-        Stroke::new(2.0, Color32::from_rgb(255, 215, 70)),
+        Stroke::new(2.0_f32, Color32::from_rgb(255, 215, 70)),
     );
 }
 
@@ -1639,7 +1639,7 @@ fn draw_transect_profile(
             rect.bottom() - 8.0 - yf * (rect.height() - 24.0),
         );
         if let Some(p0) = prev {
-            painter.line_segment([p0, pt], Stroke::new(2.0, Color32::from_rgb(255, 210, 65)));
+            painter.line_segment([p0, pt], Stroke::new(2.0_f32, Color32::from_rgb(255, 210, 65)));
         }
         prev = Some(pt);
     }

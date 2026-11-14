@@ -1053,10 +1053,10 @@ pub fn detect_mslp_extrema(
                     if !nb.is_finite() {
                         continue;
                     }
-                    if nb <= v {
+                    if nb < v {
                         is_min = false;
                     }
-                    if nb >= v {
+                    if nb > v {
                         is_max = false;
                     }
                     ring_sum += nb;
@@ -1067,7 +1067,7 @@ pub fn detect_mslp_extrema(
             if ring_cnt == 8 && (is_min || is_max) {
                 let ring_mean = ring_sum / 8.0;
                 let prom = (v - ring_mean).abs();
-                if prom >= min_prominence_hpa {
+                if prom >= min_prominence_hpa.max(1e-5) {
                     let lon = -180.0 + (c as f64 + 0.5) * (360.0 / width as f64);
                     candidates.push((
                         prom,

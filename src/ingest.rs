@@ -1031,7 +1031,7 @@ pub fn parse_erddap_oisst_csv(
         }
         let ts = idx_time
             .and_then(|i| parts.get(i))
-            .filter(|s| !s.is_empty() && *s != "UTC")
+            .filter(|s| !s.is_empty() && **s != "UTC")
             .map(|s| (*s).to_string())
             .unwrap_or_else(|| fallback_time.to_string());
 

@@ -1312,9 +1312,11 @@ pub fn read_zarr_v3_chunk_f32(
     Ok(unpack_f32_le(&decoded))
 }
 
-/// Magic header for lossless byte-shuffled LZ4 SQLite raster blobs (`"TTZ1"` + codec `1u8`).
+/// Magic header for lossless compressed SQLite raster blobs (`"TTZ1"` + codec tag).
 const SQLITE_COMPRESSED_MAGIC: &[u8; 4] = b"TTZ1";
 const SQLITE_CODEC_SHUFFLE_LZ4: u8 = 1;
+const SQLITE_CODEC_PRED2_SHUFFLE_LZ4: u8 = 2;
+const CANON_NAN_BITS: u32 = 0x7fc0_0000;
 
 /// Group byte lanes `0, 1, 2, 3` across `values` so IEEE-754 exponents & sign bits compress tightly.
 pub fn byte_shuffle_f32(values: &[f32]) -> Vec<u8> {
@@ -1345,29 +1347,108 @@ pub fn byte_unshuffle_f32(shuffled: &[u8], count: usize) -> Vec<f32> {
     out
 }
 
-/// Compress `values` losslessly using IEEE-754 byte-shuffling + pure-Rust `lz4_flex`.
+/// Lossless NaN-skipping 2nd-order IEEE-754 bit-predictor + ZigZag + byte-shuffle encoder.
+fn encode_pred2_shuffle(values: &[f32]) -> Vec<u8> {
+    let n = values.len();
+    let mask_len = (n + 7) / 8;
+    let mut out = vec![0u8; mask_len + n * 4];
+    let (mut p1, mut p2, mut hist) = (0u32, 0u32, 0u8);
+    let base = mask_len;
+
+    for (i, &v) in values.iter().enumerate() {
+        let bits = v.to_bits();
+        if bits == CANON_NAN_BITS {
+            out[i >> 3] |= 1u8 << (i & 7);
+        } else {
+            let pred = match hist {
+                0 => 0,
+                1 => p1,
+                _ => p1.wrapping_add(p1).wrapping_sub(p2),
+            };
+            let delta = bits.wrapping_sub(pred) as i32;
+            let zz = ((delta << 1) ^ (delta >> 31)) as u32;
+            out[base + i] = zz as u8;
+            out[base + n + i] = (zz >> 8) as u8;
+            out[base + 2 * n + i] = (zz >> 16) as u8;
+            out[base + 3 * n + i] = (zz >> 24) as u8;
+            p2 = p1;
+            p1 = bits;
+            if hist < 2 {
+                hist += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of `encode_pred2_shuffle`, restoring exact IEEE-754 `f32` bits.
+fn decode_pred2_shuffle(buf: &[u8], count: usize) -> Option<Vec<f32>> {
+    let mask_len = (count + 7) / 8;
+    if buf.len() != mask_len + count * 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    let (mut p1, mut p2, mut hist) = (0u32, 0u32, 0u8);
+    let base = mask_len;
+
+    for i in 0..count {
+        if (buf[i >> 3] >> (i & 7)) & 1 != 0 {
+            out.push(f32::from_bits(CANON_NAN_BITS));
+        } else {
+            let zz = u32::from_le_bytes([
+                buf[base + i],
+                buf[base + count + i],
+                buf[base + 2 * count + i],
+                buf[base + 3 * count + i],
+            ]);
+            let delta = ((zz >> 1) as i32) ^ (-((zz & 1) as i32));
+            let pred = match hist {
+                0 => 0,
+                1 => p1,
+                _ => p1.wrapping_add(p1).wrapping_sub(p2),
+            };
+            let bits = pred.wrapping_add(delta as u32);
+            p2 = p1;
+            p1 = bits;
+            if hist < 2 {
+                hist += 1;
+            }
+            out.push(f32::from_bits(bits));
+        }
+    }
+    Some(out)
+}
+
+/// Compress `values` losslessly using byte-shuffling + `lz4_flex` (selecting 2nd-order predictor when smaller).
 pub fn pack_f32_compressed(values: &[f32]) -> Vec<u8> {
     let count = values.len() as u32;
-    let shuffled = byte_shuffle_f32(values);
-    let lz4_bytes = lz4_flex::block::compress_prepend_size(&shuffled);
+    let lz4_c1 = lz4_flex::block::compress_prepend_size(&byte_shuffle_f32(values));
+    let lz4_c2 = lz4_flex::block::compress_prepend_size(&encode_pred2_shuffle(values));
+    let (codec, lz4_bytes) = if lz4_c2.len() < lz4_c1.len() {
+        (SQLITE_CODEC_PRED2_SHUFFLE_LZ4, lz4_c2)
+    } else {
+        (SQLITE_CODEC_SHUFFLE_LZ4, lz4_c1)
+    };
     let mut out = Vec::with_capacity(9 + lz4_bytes.len());
     out.extend_from_slice(SQLITE_COMPRESSED_MAGIC);
-    out.push(SQLITE_CODEC_SHUFFLE_LZ4);
+    out.push(codec);
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&lz4_bytes);
     out
 }
 
-/// Transparently decode either a `"TTZ1"` byte-shuffled LZ4 blob OR a legacy uncompressed `f32` blob.
+/// Transparently decode `"TTZ1"` compressed blobs (codec 1 or 2) OR legacy uncompressed `f32` blobs.
 pub fn unpack_f32_auto(bytes: &[u8]) -> Vec<f32> {
-    if bytes.len() >= 9
-        && &bytes[0..4] == SQLITE_COMPRESSED_MAGIC
-        && bytes[4] == SQLITE_CODEC_SHUFFLE_LZ4
-    {
+    if bytes.len() >= 9 && &bytes[0..4] == SQLITE_COMPRESSED_MAGIC {
         let count = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
-        if let Ok(shuffled) = lz4_flex::block::decompress_size_prepended(&bytes[9..]) {
-            if shuffled.len() == count * 4 {
-                return byte_unshuffle_f32(&shuffled, count);
+        if let Ok(buf) = lz4_flex::block::decompress_size_prepended(&bytes[9..]) {
+            if bytes[4] == SQLITE_CODEC_SHUFFLE_LZ4 && buf.len() == count * 4 {
+                return byte_unshuffle_f32(&buf, count);
+            }
+            if bytes[4] == SQLITE_CODEC_PRED2_SHUFFLE_LZ4 {
+                if let Some(decoded) = decode_pred2_shuffle(&buf, count) {
+                    return decoded;
+                }
             }
         }
     }

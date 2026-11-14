@@ -1,7 +1,10 @@
 //! End-to-end integration tests for TerraTwin HPC Climate Modeling & Telemetry Hub.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use terratwin_climate_hub::{
+    coastlines::{CONTINENT_POLYLINES, REFERENCE_OBSERVATORIES, TELECONNECTION_BASINS},
+    colormaps::{default_layer_style, shade_basemap_rgb, ColormapPalette},
     db::{
         pack_f32_compressed, pack_f32_le, read_zarr_v3_chunk_f32, unpack_f32_auto, unpack_f32_le,
         ClimateDatabase, RawTelemetrySample, RetentionPolicy, ZarrCompressionCodec,
@@ -173,7 +176,7 @@ fn verifies_two_layer_qgpv_helmholtz_inversion_and_cyclone_evolution() {
 
     let (q1, q2) =
         compute_two_layer_qgpv_from_streamfunctions(&psi1_true, &psi2_true, &elev, w, h);
-    let (psi1_rec, psi2_rec) = invert_two_layer_qgpv_streamfunctions(&q1, &q2, &elev, w, h);
+    let (psi1_rec, _psi2_rec) = invert_two_layer_qgpv_streamfunctions(&q1, &q2, &elev, w, h);
 
     let max_p1 = psi1_true
         .iter()
@@ -525,7 +528,7 @@ fn executes_multi_tick_coupled_sqlite_simulation_for_all_34_layers() {
         .expect("Tick 0 synoptic MSLP + QGPV state must exist in SQLite");
     assert!(syn0.u_component.is_some() && syn0.v_component.is_some());
 
-    let engine = ClimateSimulationEngine::new(schema, db.clone());
+    let engine = ClimateSimulationEngine::new(schema.clone(), db.clone());
     cfg.advance_tick();
     let r1 = engine
         .step_all_layers(&cfg)
@@ -643,7 +646,7 @@ fn verifies_byte_shuffled_lz4_blobs_tick_pruning_and_zarr_v3_codecs() {
         thermal_diffusivity_m2_s: 4.0e5,
         prognostic_relaxation_alpha: 0.16,
     };
-    let engine = ClimateSimulationEngine::new(schema, db.clone());
+    let engine = ClimateSimulationEngine::new(schema.clone(), db.clone());
     for _ in 0..4 {
         engine.step_all_layers(&cfg).unwrap();
         cfg.advance_tick();
@@ -684,5 +687,228 @@ fn verifies_byte_shuffled_lz4_blobs_tick_pruning_and_zarr_v3_codecs() {
 
     let prune_rep = db.prune_expired_history(true).unwrap();
     assert!(prune_rep.grid_blob_bytes_remaining > 0);
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[test]
+fn colormaps_palettes_and_all_34_schema_layers_render_valid_rgb() {
+    for pal in ColormapPalette::ALL {
+        assert!(!pal.label().is_empty());
+        let c_low = pal.sample_rgb(-0.5);
+        let c0 = pal.sample_rgb(0.0);
+        let c_mid = pal.sample_rgb(0.5);
+        let c1 = pal.sample_rgb(1.0);
+        let c_high = pal.sample_rgb(1.5);
+        assert_eq!(c_low, c0, "{:?} must clamp below 0.0", pal);
+        assert_eq!(c_high, c1, "{:?} must clamp above 1.0", pal);
+        assert!(
+            c0 != c_mid || c_mid != c1,
+            "{:?} must exhibit RGB variation across [0, 1]",
+            pal
+        );
+    }
+
+    let schema = HubSchema::load(None).expect("Embedded schema must load");
+    let layers = schema.all_layers();
+    assert_eq!(layers.len(), 34);
+    for (_, layer) in layers {
+        let (pal, min_v, max_v) = default_layer_style(&layer.id);
+        assert!(min_v.is_finite() && max_v.is_finite() && min_v < max_v);
+        assert_ne!(
+            (pal, min_v, max_v),
+            (ColormapPalette::Viridis, 0.0, 100.0),
+            "Layer {} must have a dedicated scientific palette range",
+            layer.id
+        );
+    }
+
+    for basemap_id in [
+        "bathymetry_topography_shaded",
+        "dark_telemetry_vector",
+        "viirs_nightlights_baseline",
+    ] {
+        let ocean = shade_basemap_rgb(basemap_id, 15.0, -40.0, -3500.0);
+        let land = shade_basemap_rgb(basemap_id, 35.0, -90.0, 1200.0);
+        assert_ne!(ocean, land, "Basemap {} must distinguish ocean and land", basemap_id);
+    }
+}
+
+#[test]
+fn coastlines_basins_and_reference_observatories_invariants() {
+    assert_eq!(CONTINENT_POLYLINES.len(), 7);
+    for (idx, poly) in CONTINENT_POLYLINES.iter().enumerate() {
+        assert!(poly.len() >= 10, "Continent {} must contain >= 10 vertices", idx);
+        let first = poly.first().unwrap();
+        let last = poly.last().unwrap();
+        assert!(
+            (first.0 - last.0).abs() < 1e-4 && (first.1 - last.1).abs() < 1e-4,
+            "Continent polyline {} must form a closed ring",
+            idx
+        );
+        for &(lat, lon) in *poly {
+            assert!(
+                (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon),
+                "Coastline vertex ({}, {}) out of bounds",
+                lat,
+                lon
+            );
+        }
+    }
+
+    assert_eq!(TELECONNECTION_BASINS.len(), 5);
+    let mut basin_ids = HashSet::new();
+    for &(id, label, min_lat, max_lat, min_lon, max_lon) in TELECONNECTION_BASINS {
+        assert!(basin_ids.insert(id), "Duplicate teleconnection basin id {}", id);
+        assert!(!label.is_empty());
+        assert!(min_lat < max_lat && min_lon < max_lon);
+        assert!((-90.0..=90.0).contains(&min_lat) && (-90.0..=90.0).contains(&max_lat));
+        assert!((-180.0..=180.0).contains(&min_lon) && (-180.0..=180.0).contains(&max_lon));
+    }
+
+    assert_eq!(REFERENCE_OBSERVATORIES.len(), 20);
+    let mut station_names = HashSet::new();
+    for &(name, lat, lon, role) in REFERENCE_OBSERVATORIES {
+        assert!(station_names.insert(name), "Duplicate station {}", name);
+        assert!(!role.is_empty());
+        assert!((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon));
+    }
+}
+
+#[test]
+fn zarr_v3_raw_none_codec_and_regional_bbox_subset_exact_values() {
+    let pid = std::process::id();
+    let tmp_db = std::env::temp_dir().join(format!("terratwin_zarr_none_bbox_{pid}.db"));
+    let zdir = std::env::temp_dir().join(format!("terratwin_zarr_none_bbox_{pid}.zarr"));
+    let _ = std::fs::remove_file(&tmp_db);
+    let _ = std::fs::remove_dir_all(&zdir);
+
+    let schema = HubSchema::load(None).unwrap();
+    let db = ClimateDatabase::open(&tmp_db).unwrap();
+    db.sync_schema_catalog(&schema).unwrap();
+
+    let cfg = SimulationConfig {
+        grid_width: 72,
+        grid_height: 36,
+        scenario: SspScenario::Ssp2_45,
+        sim_year: 2026.86,
+        day_of_year: 315.0,
+        hour_utc: 0.0,
+        atmospheric_level_hpa: 850.0,
+        ocean_depth_m: 0.0,
+        time_step_secs: 3600.0,
+        thermal_diffusivity_m2_s: 4.5e5,
+        prognostic_relaxation_alpha: 0.16,
+    };
+    let engine = ClimateSimulationEngine::new(schema.clone(), db.clone());
+    engine.step_all_layers(&cfg).unwrap();
+
+    let (min_lat, max_lat, min_lon, max_lon) = (-30.0, 30.0, -120.0, -60.0);
+    let summary = db
+        .export_zarr_v3_store_with_codec(
+            "sst_marine_heatwaves",
+            cfg.scenario,
+            0.0,
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+            (6, 6),
+            ZarrCompressionCodec::None,
+            &zdir,
+        )
+        .unwrap();
+
+    assert_eq!(summary.codec, "bytes");
+    assert_eq!(summary.shape, [12, 12]);
+    assert_eq!(summary.uncompressed_bytes, summary.compressed_bytes);
+
+    let grid = db
+        .load_latest_grid("sst_marine_heatwaves", cfg.scenario, 0.0)
+        .unwrap()
+        .unwrap();
+    let mut expected_rows = Vec::new();
+    for r in 0..grid.height {
+        let lat = 90.0 - (r as f64 + 0.5) * (180.0 / grid.height as f64);
+        if (min_lat..=max_lat).contains(&lat) {
+            expected_rows.push(r);
+        }
+    }
+    let mut expected_cols = Vec::new();
+    for c in 0..grid.width {
+        let lon = -180.0 + (c as f64 + 0.5) * (360.0 / grid.width as f64);
+        if (min_lon..=max_lon).contains(&lon) {
+            expected_cols.push(c);
+        }
+    }
+    assert_eq!(expected_rows.len(), 12);
+    assert_eq!(expected_cols.len(), 12);
+
+    let chunk00 = read_zarr_v3_chunk_f32(&zdir.join("sst_marine_heatwaves"), 0, 0).unwrap();
+    assert_eq!(chunk00.len(), 36);
+    for lr in 0..6 {
+        for lc in 0..6 {
+            let expected = grid.values[expected_rows[lr] * grid.width + expected_cols[lc]];
+            let actual = chunk00[lr * 6 + lc];
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&zdir);
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[test]
+fn sqlite_retention_policy_prunes_old_ticks_and_preserves_latest() {
+    let pid = std::process::id();
+    let tmp_db = std::env::temp_dir().join(format!("terratwin_explicit_prune_{pid}.db"));
+    let _ = std::fs::remove_file(&tmp_db);
+
+    let schema = HubSchema::load(None).unwrap();
+    let db = ClimateDatabase::open(&tmp_db).unwrap();
+    db.sync_schema_catalog(&schema).unwrap();
+    db.set_retention_policy(RetentionPolicy {
+        max_ticks_per_scenario: 10,
+        max_raw_samples_per_layer: 64,
+        max_sync_log_rows: 32,
+    });
+
+    let mut cfg = SimulationConfig {
+        grid_width: 36,
+        grid_height: 18,
+        scenario: SspScenario::Ssp5_85,
+        sim_year: 2030.0,
+        day_of_year: 120.0,
+        hour_utc: 0.0,
+        atmospheric_level_hpa: 500.0,
+        ocean_depth_m: 0.0,
+        time_step_secs: 3600.0,
+        thermal_diffusivity_m2_s: 4.0e5,
+        prognostic_relaxation_alpha: 0.16,
+    };
+    let engine = ClimateSimulationEngine::new(schema.clone(), db.clone());
+    let mut all_ts = Vec::new();
+    for _ in 0..5 {
+        let r = engine.step_all_layers(&cfg).unwrap();
+        all_ts.push(r.timestamp_utc);
+        cfg.advance_tick();
+    }
+    assert_eq!(db.list_available_timestamps(cfg.scenario, 10).unwrap().len(), 5);
+
+    db.set_retention_policy(RetentionPolicy {
+        max_ticks_per_scenario: 2,
+        max_raw_samples_per_layer: 64,
+        max_sync_log_rows: 32,
+    });
+    let report = db.prune_expired_history(true).unwrap();
+    assert!(report.grids_deleted > 0);
+    assert!(report.grid_blob_bytes_remaining > 0);
+
+    let kept = db.list_available_timestamps(cfg.scenario, 10).unwrap();
+    assert_eq!(kept, all_ts[3..5].to_vec());
+
     let _ = std::fs::remove_file(&tmp_db);
 }
