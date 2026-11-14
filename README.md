@@ -65,3 +65,11 @@ cargo test
 * `raw_telemetry_samples`: Indexed `(layer_id, timestamp_utc)` and `(layer_id, latitude, longitude)` observations with quality weights assimilated by the 3D-Var `PCG` solver.
 * `simulated_layer_grids`: Primary-keyed `(layer_id, scenario, timestamp_utc, vertical_level)` lossless `TTZ1` byte-shuffled `lz4_flex` raster blobs (`grid_f32_le`, `u_f32_le`, `v_f32_le`) with automatic transparent fallback for legacy uncompressed `f32` rows.
 * `global_readouts_history` & `ingestion_sync_log`: Time-series audit logs of global climate anomalies, 4D playback tick timestamps, HTTP sync latencies, and `RetentionPolicy` ring-buffer pruning checkpoints.
+
+## Citation & CRV Science Apps Hub
+
+* **CRV Science Apps Preprint (`APP-PREPRINT-10`)**: *TerraTwin: High-Performance Coupled Climate Telemetry and Multi-Scenario Shared Socioeconomic Pathway Projection Engine* — [https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp](https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp)
+* **Concept DOI**: [`10.5281/zenodo.24222392`](https://doi.org/10.5281/zenodo.24222392)
+* **CRV Science Apps Hub**: [https://crvscience.com/apps](https://crvscience.com/apps)
+* **Machine-Readable Citation**: See [`CITATION.cff`](CITATION.cff) and headless empirical outputs in [`validation/`](validation/README.md).
+

@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: "crvscience-terratwin"
+message: "If you use TerraTwin or its validation telemetry in academic work, please cite both this software repository and its companion CRV Science Apps Preprint."
+type: software
+authors:
+  - family-names: "White"
+    given-names: "Bryan P."
+    affiliation: "CRV Science Labs"
+version: "2.5.0"
+doi: "10.5281/zenodo.24222392"
+url: "https://crvscience.com/apps"
+repository-code: "https://github.com/bpwhite/crvscience-terratwin"
+license: "MIT"
+preferred-citation:
+  type: article
+  title: "TerraTwin: High-Performance Coupled Climate Telemetry and Multi-Scenario Shared Socioeconomic Pathway Projection Engine"
+  authors:
+    - family-names: "White"
+      given-names: "Bryan P."
+      affiliation: "CRV Science Labs"
+  year: 2026
+  journal: "CRV Science Apps Preprints"
+  doi: "10.5281/zenodo.24222392"
+  url: "https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp"
+  notes: "Preprint ID: APP-PREPRINT-10"

@@ -1,0 +1,144 @@
+{
+  "concept_doi": "10.5281/zenodo.24222392",
+  "preprint_id": "APP-PREPRINT-10",
+  "preprint_url": "https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp",
+  "repository": "crvscience-terratwin",
+  "slug": "terratwin-coupled-climate-ssp",
+  "t1_ssp_trajectories_1950_2100": {
+    "csv_artifact": "validation/ssp_projections_1950_2100.csv",
+    "csv_bytes": 7074,
+    "endpoints_2100": {
+      "SSP1-1.9": {
+        "co2_ppm_2100": 393.0,
+        "co2_radiative_forcing_2100_wm2": 1.852,
+        "global_2m_temp_anomaly_1950_c": 0.613,
+        "global_2m_temp_anomaly_2050_c": 1.965,
+        "global_2m_temp_anomaly_2100_c": 1.53,
+        "nominal_target_forcing_2100_wm2": 1.9
+      },
+      "SSP2-4.5": {
+        "co2_ppm_2100": 603.0,
+        "co2_radiative_forcing_2100_wm2": 4.142,
+        "global_2m_temp_anomaly_1950_c": 0.613,
+        "global_2m_temp_anomaly_2050_c": 2.263,
+        "global_2m_temp_anomaly_2100_c": 3.152,
+        "nominal_target_forcing_2100_wm2": 4.5
+      },
+      "SSP3-7.0": {
+        "co2_ppm_2100": 867.0,
+        "co2_radiative_forcing_2100_wm2": 6.085,
+        "global_2m_temp_anomaly_1950_c": 0.613,
+        "global_2m_temp_anomaly_2050_c": 2.588,
+        "global_2m_temp_anomaly_2100_c": 4.536,
+        "nominal_target_forcing_2100_wm2": 7.0
+      },
+      "SSP5-8.5": {
+        "co2_ppm_2100": 1135.0,
+        "co2_radiative_forcing_2100_wm2": 7.526,
+        "global_2m_temp_anomaly_1950_c": 0.613,
+        "global_2m_temp_anomaly_2050_c": 2.812,
+        "global_2m_temp_anomaly_2100_c": 5.558,
+        "nominal_target_forcing_2100_wm2": 8.5
+      }
+    },
+    "row_count": 124,
+    "step_years": 5
+  },
+  "t2_multilayer_telemetry_2100": {
+    "scenarios": {
+      "SSP1-1.9": {
+        "arid_biome_land_pct": 19.96,
+        "biome_aridity_index": 0.4561,
+        "global_sea_ice_area_mkm2": 0.611,
+        "global_sea_ice_extent_mkm2": 1.039,
+        "land_fire_weather_index": 11.486,
+        "land_sif_photosynthesis": 0.918,
+        "land_soil_moisture_m3_m3": 0.2518,
+        "land_wbgt_heat_stress_c": 7.401,
+        "mean_coastal_surge_m": 1.311,
+        "mean_sea_ice_thickness_m": 1.001,
+        "nh_sea_ice_extent_mkm2": 0.34,
+        "subsurface_100m_temp_mean_c": 8.176,
+        "thermosteric_slr_mean_cm": 15.835,
+        "upper_ocean_ohc_0_2000m_gj_m2": 66.432
+      },
+      "SSP2-4.5": {
+        "arid_biome_land_pct": 19.97,
+        "biome_aridity_index": 0.5089,
+        "global_sea_ice_area_mkm2": 0.543,
+        "global_sea_ice_extent_mkm2": 1.039,
+        "land_fire_weather_index": 12.813,
+        "land_sif_photosynthesis": 1.075,
+        "land_soil_moisture_m3_m3": 0.2518,
+        "land_wbgt_heat_stress_c": 8.981,
+        "mean_coastal_surge_m": 1.679,
+        "mean_sea_ice_thickness_m": 1.001,
+        "nh_sea_ice_extent_mkm2": 0.34,
+        "subsurface_100m_temp_mean_c": 8.402,
+        "thermosteric_slr_mean_cm": 54.716,
+        "upper_ocean_ohc_0_2000m_gj_m2": 67.395
+      },
+      "SSP3-7.0": {
+        "arid_biome_land_pct": 20.01,
+        "biome_aridity_index": 0.5566,
+        "global_sea_ice_area_mkm2": 0.53,
+        "global_sea_ice_extent_mkm2": 1.039,
+        "land_fire_weather_index": 14.012,
+        "land_sif_photosynthesis": 1.218,
+        "land_soil_moisture_m3_m3": 0.2517,
+        "land_wbgt_heat_stress_c": 10.333,
+        "mean_coastal_surge_m": 1.907,
+        "mean_sea_ice_thickness_m": 1.001,
+        "nh_sea_ice_extent_mkm2": 0.34,
+        "subsurface_100m_temp_mean_c": 8.6,
+        "thermosteric_slr_mean_cm": 87.717,
+        "upper_ocean_ohc_0_2000m_gj_m2": 68.236
+      },
+      "SSP5-8.5": {
+        "arid_biome_land_pct": 20.01,
+        "biome_aridity_index": 0.5931,
+        "global_sea_ice_area_mkm2": 0.522,
+        "global_sea_ice_extent_mkm2": 1.039,
+        "land_fire_weather_index": 14.93,
+        "land_sif_photosynthesis": 1.326,
+        "land_soil_moisture_m3_m3": 0.2517,
+        "land_wbgt_heat_stress_c": 11.337,
+        "mean_coastal_surge_m": 2.054,
+        "mean_sea_ice_thickness_m": 1.0,
+        "nh_sea_ice_extent_mkm2": 0.34,
+        "subsurface_100m_temp_mean_c": 8.746,
+        "thermosteric_slr_mean_cm": 112.196,
+        "upper_ocean_ohc_0_2000m_gj_m2": 68.859
+      }
+    }
+  },
+  "t3_arctic_amplification_2100": {
+    "latitudinal_bands": {
+      "SSP2-4.5": {
+        "antarctic_lt_66_5s_warming_c": 3.583,
+        "arctic_gt_66_5n_warming_c": 5.908,
+        "arctic_to_global_amplification_ratio": 1.91,
+        "arctic_to_tropics_amplification_ratio": 2.506,
+        "global_mean_warming_c": 3.093,
+        "tropics_pm_23_5_warming_c": 2.357
+      },
+      "SSP3-7.0": {
+        "antarctic_lt_66_5s_warming_c": 5.266,
+        "arctic_gt_66_5n_warming_c": 8.673,
+        "arctic_to_global_amplification_ratio": 1.918,
+        "arctic_to_tropics_amplification_ratio": 2.543,
+        "global_mean_warming_c": 4.521,
+        "tropics_pm_23_5_warming_c": 3.41
+      },
+      "SSP5-8.5": {
+        "antarctic_lt_66_5s_warming_c": 6.514,
+        "arctic_gt_66_5n_warming_c": 10.723,
+        "arctic_to_global_amplification_ratio": 1.922,
+        "arctic_to_tropics_amplification_ratio": 2.558,
+        "global_mean_warming_c": 5.58,
+        "tropics_pm_23_5_warming_c": 4.192
+      }
+    }
+  },
+  "version": "2.5.0"
+}
