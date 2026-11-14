@@ -13,7 +13,7 @@ repository-code: "https://github.com/bpwhite/crvscience-terratwin"
 license: "MIT"
 preferred-citation:
   type: article
-  title: "TerraTwin: High-Performance Coupled Climate Telemetry and Multi-Scenario Shared Socioeconomic Pathway Projection Engine"
+  title: "TerraTwin: Fast Climate Projections for Global Warming, Sea-Level Rise, and Arctic Change"
   authors:
     - family-names: "White"
       given-names: "Bryan P."
