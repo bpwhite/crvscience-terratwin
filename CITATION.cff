@@ -11,7 +11,7 @@ version: "2.5.0"
 doi: "10.5281/zenodo.24222392"
 url: "https://crvscience.com/apps"
 repository-code: "https://github.com/bpwhite/crvscience-terratwin"
-license: "MIT"
+license: "GPL-3.0-or-later"
 preferred-citation:
   type: article
   title: "TerraTwin: Fast Climate Projections for Global Warming, Sea-Level Rise, and Arctic Change"

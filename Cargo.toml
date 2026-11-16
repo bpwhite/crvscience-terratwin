@@ -3,7 +3,7 @@ name = "terratwin-climate-hub"
 version = "2.5.0"
 edition = "2021"
 description = "TerraTwin HPC Climate Modeling & Telemetry Hub — Rust native headless daemon + desktop global map GUI with SQLite data management and multi-threaded Rayon climate physics simulation"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 
 [features]
 default = ["gui"]
@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = "0.13"
 
 # Native GUI dependencies (optional so pure headless server builds can pass --no-default-features)
-eframe = { version = "=0.29.1", optional = true }
+eframe = { version = "=0.29.1", features = ["wgpu"], optional = true }
 egui = { version = "=0.29.1", optional = true }
 
 [profile.release]
