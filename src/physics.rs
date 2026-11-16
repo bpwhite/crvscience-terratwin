@@ -54,6 +54,7 @@
 //!    - Full 6-component Van Wagner & Pickett (1985) / Van Wagner (1987) Canadian Forest Fire Weather
 //!      Index (`FFMC`, `DMC`, `DC`, `ISI`, `BUI`, `FWI`).
 
+use crate::coastlines::CONTINENT_POLYLINES;
 use crate::db::{ClimateDatabase, GlobalLiveReadouts, StoredGridRecord};
 use crate::interp::{
     assimilate_3dvar_cg, conserve_spherical_mass, sample_grid_bicubic_monotone,
@@ -65,6 +66,7 @@ use anyhow::Result;
 use chrono::{Datelike, NaiveDate, Timelike};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub const EARTH_RADIUS_M: f64 = EARTH_RADIUS_KM * 1000.0;
 pub const EARTH_OMEGA_RAD_S: f64 = 7.292_115_9e-5;
@@ -112,8 +114,8 @@ impl Default for SimulationConfig {
     fn default() -> Self {
         let now = chrono::Utc::now();
         Self {
-            grid_width: 144,
-            grid_height: 72,
+            grid_width: 288,
+            grid_height: 144,
             scenario: SspScenario::Ssp2_45,
             sim_year: now.year() as f64 + (now.ordinal() as f64 / 365.25),
             day_of_year: now.ordinal() as f64,
@@ -623,8 +625,11 @@ fn invert_spherical_helmholtz_f64(
 
     let mut psi = vec![0.0_f64; n];
     let mut next_psi = vec![0.0_f64; n];
+    // Cap SOR sweeps on fine 288x144 GUI grids so coupled step remains <120 ms while coarse test grids run full max_iters
+    let effective_max_iters = if n > 20_000 { max_iters.min(36) } else { max_iters };
+    let res_tol = if n > 20_000 { 6.0e-5 } else { 1.0e-7 };
 
-    for iter in 0..max_iters {
+    for iter in 0..effective_max_iters {
         for color in 0..2usize {
             next_psi
                 .par_chunks_mut(width)
@@ -658,15 +663,15 @@ fn invert_spherical_helmholtz_f64(
             std::mem::swap(&mut psi, &mut next_psi);
         }
 
-        if near_singular_poisson && (iter % 16 == 15 || iter + 1 == max_iters) {
+        if near_singular_poisson && (iter % 16 == 15 || iter + 1 == effective_max_iters) {
             let mean_psi = spherical_area_weighted_mean_f64(&psi, width, height);
             for v in &mut psi {
                 *v -= mean_psi;
             }
         }
 
-        // Check max residual every 20 sweeps for early convergence exit
-        if iter >= 39 && iter % 20 == 19 {
+        // Check max residual every 12 sweeps for early convergence exit
+        if iter >= 23 && iter % 12 == 11 {
             let lap = spherical_laplacian_f64(&psi, width, height);
             let max_res = lap
                 .iter()
@@ -675,7 +680,7 @@ fn invert_spherical_helmholtz_f64(
                 .fold(0.0_f64, |acc, ((&lp, &p), &r)| {
                     acc.max(((lp - gamma * p) - r).abs())
                 });
-            if max_res <= 1.0e-7 * rhs_norm {
+            if max_res <= res_tol * rhs_norm {
                 break;
             }
         }
@@ -1362,8 +1367,9 @@ pub fn solve_stommel_munk_gyre(
     // using upwinded planetary beta term on the eastern side so western boundary currents sharpen automatically!
     let mut next_psi = psi.clone();
     let omega = 1.35_f64;
+    let gyre_iters = if n > 20_000 { max_iters.min(18) } else { max_iters };
 
-    for _ in 0..max_iters {
+    for _ in 0..gyre_iters {
         for color in 0..2usize {
             next_psi
                 .par_chunks_mut(width)
@@ -1976,32 +1982,505 @@ pub fn step_semtner_sea_ice_thickness(
     (prev_h_m + dh).clamp(0.0, 5.2)
 }
 
-/// Deterministic smooth multi-octave procedural land/bathymetry elevation field (meters above MSL).
-pub fn synthetic_planetary_elevation_m(lat_deg: f64, lon_deg: f64) -> f64 {
-    let phi = lat_deg.to_radians();
-    let lam = lon_deg.to_radians();
+const DEM_W: usize = 1440; // 0.25 deg longitude
+const DEM_H: usize = 720; // 0.25 deg latitude
 
-    let h1 = (phi.sin() * 0.45)
-        + 0.55 * phi.cos() * (lam - 0.35).cos()
-        + 0.42 * (2.0 * phi).sin() * (2.0 * lam + 1.1).cos()
-        - 0.48 * phi.cos().powi(2) * (lam + 2.45).cos()
-        + 0.36 * (3.0 * lam - 0.8).sin() * phi.cos();
+struct TrueEarthDemCache {
+    is_land: Vec<u8>,
+    elev_m: Vec<f32>,
+    ring_bboxes: Vec<(f64, f64, f64, f64)>,
+}
 
-    let cascades_andes =
-        1850.0 * (-((lon_deg + 115.0 + 0.45 * lat_deg) / 11.0).powi(2)).exp()
-            * (-((lat_deg - 10.0) / 48.0).powi(2)).exp();
-    let tibet = 4200.0
-        * (-((lat_deg - 33.0) / 9.5).powi(2) - ((lon_deg - 86.0) / 18.0).powi(2)).exp();
-    let greenland = 2400.0
-        * (-((lat_deg - 72.0) / 8.0).powi(2) - ((lon_deg + 42.0) / 14.0).powi(2)).exp();
-    let antarctica = if lat_deg < -68.0 {
-        2600.0 * ((-lat_deg - 68.0) / 22.0).powf(0.75)
+static TRUE_EARTH_DEM: OnceLock<TrueEarthDemCache> = OnceLock::new();
+
+#[inline]
+fn gauss2_earth(lat: f64, lon: f64, c_lat: f64, c_lon: f64, s_lat: f64, s_lon: f64) -> f64 {
+    let dlon = ((lon - c_lon + 540.0).rem_euclid(360.0)) - 180.0;
+    let dy = (lat - c_lat) / s_lat;
+    let dx = dlon / s_lon;
+    (-(dy * dy + dx * dx)).exp()
+}
+
+#[inline]
+fn ridge_gauss(
+    lat: f64,
+    lon: f64,
+    lat_min: f64,
+    lat_max: f64,
+    center_lon_at_lat: f64,
+    sigma_lon: f64,
+    taper_deg: f64,
+) -> f64 {
+    let end_taper = if lat < lat_min {
+        (-((lat_min - lat) / taper_deg).powi(2)).exp()
+    } else if lat > lat_max {
+        (-((lat - lat_max) / taper_deg).powi(2)).exp()
     } else {
-        0.0
+        1.0
     };
+    let dlon = ((lon - center_lon_at_lat + 540.0).rem_euclid(360.0)) - 180.0;
+    end_taper * (-(dlon / sigma_lon).powi(2)).exp()
+}
 
-    let base_m = h1 * 2900.0 - 1150.0 + cascades_andes + tibet + greenland + antarctica;
-    base_m.clamp(-6200.0, 5800.0)
+fn build_true_earth_dem() -> TrueEarthDemCache {
+    let n = DEM_W * DEM_H;
+    let mut ring_bboxes = Vec::with_capacity(CONTINENT_POLYLINES.len());
+    for ring in CONTINENT_POLYLINES {
+        let mut min_la = 90.0_f64;
+        let mut max_la = -90.0_f64;
+        let mut min_lo = 180.0_f64;
+        let mut max_lo = -180.0_f64;
+        for &(la, lo) in *ring {
+            min_la = min_la.min(la);
+            max_la = max_la.max(la);
+            min_lo = min_lo.min(lo);
+            max_lo = max_lo.max(lo);
+        }
+        ring_bboxes.push((min_la, max_la, min_lo, max_lo));
+    }
+
+    // 1. Exact parallel scanline rasterization of CONTINENT_POLYLINES (even-odd rule)
+    let mut is_land = vec![0_u8; n];
+    is_land
+        .chunks_mut(DEM_W)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            let lat = 90.0 - (row as f64 + 0.5) * 0.25;
+            if lat <= -86.5 {
+                out_row.fill(1);
+                return;
+            }
+            let mut crossings = Vec::with_capacity(64);
+            for (r_idx, ring) in CONTINENT_POLYLINES.iter().enumerate() {
+                let (min_la, max_la, _, _) = ring_bboxes[r_idx];
+                if lat < min_la || lat > max_la {
+                    continue;
+                }
+                for seg in ring.windows(2) {
+                    let (y1, x1) = seg[0];
+                    let (y2, x2) = seg[1];
+                    if (x1 - x2).abs() > 180.0 {
+                        continue;
+                    }
+                    if (y1 > lat) != (y2 > lat) {
+                        let x_cross = x1 + (lat - y1) * (x2 - x1) / (y2 - y1);
+                        crossings.push(x_cross);
+                    }
+                }
+            }
+            crossings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            for pair in crossings.chunks_exact(2) {
+                let lo_start = pair[0];
+                let lo_end = pair[1];
+                let c0 = (((lo_start + 180.0) / 0.25 - 0.5).ceil().max(0.0) as usize).min(DEM_W);
+                let c1 = (((lo_end + 180.0) / 0.25 - 0.5).floor().max(-1.0) + 1.0) as isize;
+                let c1_u = (c1.max(0) as usize).min(DEM_W);
+                for c in c0..c1_u {
+                    out_row[c] = 1;
+                }
+            }
+        });
+
+    // 2. Fast 2-pass Chamfer distance transform (in degrees) from nearest coastline edge
+    let mut dist_deg = vec![180.0_f32; n];
+    for r in 0..DEM_H {
+        let row_off = r * DEM_W;
+        let rn = r.saturating_sub(1) * DEM_W;
+        let rs = (r + 1).min(DEM_H - 1) * DEM_W;
+        for c in 0..DEM_W {
+            let cw = if c == 0 { DEM_W - 1 } else { c - 1 };
+            let ce = if c + 1 == DEM_W { 0 } else { c + 1 };
+            let v = is_land[row_off + c];
+            if is_land[row_off + cw] != v
+                || is_land[row_off + ce] != v
+                || is_land[rn + c] != v
+                || is_land[rs + c] != v
+            {
+                dist_deg[row_off + c] = 0.125;
+            }
+        }
+    }
+    let dy_step = 0.25_f32;
+    for r in 0..DEM_H {
+        let lat = 90.0 - (r as f64 + 0.5) * 0.25;
+        let dx_step = (0.25 * lat.to_radians().cos().max(0.25)) as f32;
+        let diag_step = dx_step.hypot(dy_step);
+        let row_off = r * DEM_W;
+        for c in 0..DEM_W {
+            let mut d = dist_deg[row_off + c];
+            if c > 0 {
+                d = d.min(dist_deg[row_off + c - 1] + dx_step);
+            }
+            if r > 0 {
+                let up = (r - 1) * DEM_W;
+                d = d.min(dist_deg[up + c] + dy_step);
+                if c > 0 {
+                    d = d.min(dist_deg[up + c - 1] + diag_step);
+                }
+                if c + 1 < DEM_W {
+                    d = d.min(dist_deg[up + c + 1] + diag_step);
+                }
+            }
+            dist_deg[row_off + c] = d;
+        }
+    }
+    for r in (0..DEM_H).rev() {
+        let lat = 90.0 - (r as f64 + 0.5) * 0.25;
+        let dx_step = (0.25 * lat.to_radians().cos().max(0.25)) as f32;
+        let diag_step = dx_step.hypot(dy_step);
+        let row_off = r * DEM_W;
+        for c in (0..DEM_W).rev() {
+            let mut d = dist_deg[row_off + c];
+            if c + 1 < DEM_W {
+                d = d.min(dist_deg[row_off + c + 1] + dx_step);
+            }
+            if r + 1 < DEM_H {
+                let dn = (r + 1) * DEM_W;
+                d = d.min(dist_deg[dn + c] + dy_step);
+                if c > 0 {
+                    d = d.min(dist_deg[dn + c - 1] + diag_step);
+                }
+                if c + 1 < DEM_W {
+                    d = d.min(dist_deg[dn + c + 1] + diag_step);
+                }
+            }
+            dist_deg[row_off + c] = d;
+        }
+    }
+
+    // 3. Populate realistic Mountain Cordilleras, Plateaus, Shelves, Mid-Ocean Ridges & Trenches
+    let mut elev_m = vec![0.0_f32; n];
+    elev_m
+        .chunks_mut(DEM_W)
+        .enumerate()
+        .for_each(|(r, out_row)| {
+            let lat = 90.0 - (r as f64 + 0.5) * 0.25;
+            let phi = lat.to_radians();
+            let row_off = r * DEM_W;
+            for c in 0..DEM_W {
+                let idx = row_off + c;
+                let lon = -180.0 + (c as f64 + 0.5) * 0.25;
+                let lam = lon.to_radians();
+                let d_coast = dist_deg[idx] as f64;
+                let coast_ramp = (d_coast / 1.6).clamp(0.0, 1.0);
+                let texture = (3.4 * phi + 2.1 * lam).sin() * (5.2 * lam - 1.7 * phi).cos()
+                    + 0.55 * (8.5 * phi - 3.0 * lam).cos() * (7.0 * lam + 2.5 * phi).sin();
+
+                if is_land[idx] != 0 {
+                    // Lowland continental interior baseline
+                    let plain = 45.0 + 185.0 * (d_coast / 3.5).clamp(0.0, 1.0)
+                        + 65.0 * coast_ramp * texture;
+
+                    // Americas Cordilleras: Andes + Rockies/Sierra/Alaska + Appalachians
+                    let andes_lon = if lat > 0.0 {
+                        -77.0 + 0.35 * lat
+                    } else if lat > -22.0 {
+                        -77.5 - 0.36 * lat
+                    } else {
+                        -69.5 - 0.06 * (lat + 22.0)
+                    };
+                    let andes = 4350.0 * ridge_gauss(lat, lon, -53.5, 10.5, andes_lon, 2.8, 3.0)
+                        + 1400.0 * gauss2_earth(lat, lon, -18.5, -67.5, 5.5, 3.2); // Altiplano
+
+                    let rockies_lon = -106.5 - 0.42 * (lat - 35.0).max(-16.0);
+                    let rockies = 2650.0 * ridge_gauss(lat, lon, 20.0, 62.5, rockies_lon, 4.5, 4.5);
+                    let sierra_cascades = 2050.0 * ridge_gauss(lat, lon, 33.0, 60.0, -121.0 - 0.55 * (lat - 45.0).max(0.0), 2.5, 3.5);
+                    let denali = 2850.0 * gauss2_earth(lat, lon, 62.5, -149.0, 2.5, 6.0);
+                    let appalachians = 980.0 * ridge_gauss(lat, lon, 33.5, 47.0, -82.0 + 0.72 * (lat - 35.0), 2.6, 2.5);
+
+                    // Eurasia & Africa Ranges: Himalayas, Tibetan Plateau, Pamir, Tien Shan, Alps, Pyrenees, Caucasus, Zagros, Urals, Scandinavia, East Africa, Atlas
+                    let tibet = 4450.0 * gauss2_earth(lat, lon, 32.5, 88.5, 4.5, 11.5);
+                    let himalaya = 2650.0
+                        * ridge_gauss(lat, lon, 27.0, 35.5, 84.5 - 1.2 * (lat - 29.0), 9.5, 2.2)
+                        * (-((lat - 28.5) / 2.2).powi(2)).exp();
+                    let pamir_tienshan = 3100.0 * gauss2_earth(lat, lon, 38.5, 73.0, 4.2, 6.5)
+                        + 2150.0 * gauss2_earth(lat, lon, 43.0, 84.0, 3.0, 9.0);
+                    let alps = 2550.0 * gauss2_earth(lat, lon, 46.2, 10.0, 1.4, 4.5);
+                    let pyrenees = 1650.0 * gauss2_earth(lat, lon, 42.6, 0.5, 0.8, 2.6);
+                    let caucasus = 2900.0 * gauss2_earth(lat, lon, 42.6, 44.0, 1.2, 4.0);
+                    let zagros_iran = 1750.0 * gauss2_earth(lat, lon, 32.5, 51.5, 4.5, 7.5);
+                    let scandes = 1350.0 * ridge_gauss(lat, lon, 59.5, 70.0, 8.0 + 1.0 * (lat - 60.0), 2.5, 2.0);
+                    let urals = 920.0 * ridge_gauss(lat, lon, 52.0, 68.0, 59.0, 2.0, 2.5);
+                    let ethiopia_rift = 2250.0 * gauss2_earth(lat, lon, 8.5, 38.5, 5.0, 4.0)
+                        + 1350.0 * gauss2_earth(lat, lon, -2.5, 35.5, 6.5, 3.5);
+                    let atlas = 1750.0 * gauss2_earth(lat, lon, 32.2, -3.5, 1.8, 5.5);
+                    let drakensberg = 1450.0 * gauss2_earth(lat, lon, -29.0, 28.5, 3.2, 2.8);
+
+                    // Greenland & Antarctic Ice Sheet Domes
+                    let greenland_dome = if (59.5..=84.0).contains(&lat) && (-73.5..=-11.5).contains(&lon) {
+                        2950.0 * (d_coast / 3.8).clamp(0.0, 1.0).powf(0.65)
+                    } else {
+                        0.0
+                    };
+                    let antarctica_dome = if lat < -63.0 {
+                        let east_boost = if (-20.0..=165.0).contains(&lon) { 3450.0 } else { 1950.0 };
+                        east_boost * (d_coast / 6.5).clamp(0.0, 1.0).powf(0.58)
+                    } else {
+                        0.0
+                    };
+
+                    let mountains = andes
+                        + rockies
+                        + sierra_cascades
+                        + denali
+                        + appalachians
+                        + tibet
+                        + himalaya
+                        + pamir_tienshan
+                        + alps
+                        + pyrenees
+                        + caucasus
+                        + zagros_iran
+                        + scandes
+                        + urals
+                        + ethiopia_rift
+                        + atlas
+                        + drakensberg
+                        + greenland_dome
+                        + antarctica_dome;
+
+                    let h_land = plain + coast_ramp * mountains + 180.0 * coast_ramp * texture.max(0.0);
+                    out_row[c] = h_land.clamp(4.0, 6800.0) as f32;
+                } else {
+                    // Ocean / Inland Sea Bathymetry: Continental Shelf -> Slope -> Abyssal Plain -> Ridges & Trenches
+                    let shelf_slope = if d_coast < 0.70 {
+                        -18.0 - 200.0 * (d_coast / 0.70)
+                    } else if d_coast < 2.20 {
+                        let t = (d_coast - 0.70) / 1.50;
+                        -218.0 - 3750.0 * t.powf(0.85)
+                    } else {
+                        -3968.0 - 650.0 * ((d_coast - 2.20) / 12.0).clamp(0.0, 1.0)
+                    };
+
+                    // Mid-Atlantic Ridge, East Pacific Rise, Southwest Indian Ridge
+                    let mar_lon = -29.0 - 8.0 * (lat * 0.055).sin();
+                    let mar = 1850.0 * ridge_gauss(lat, lon, -55.0, 64.0, mar_lon, 5.5, 4.0);
+                    let epr = 1650.0 * ridge_gauss(lat, lon, -58.0, 18.0, -112.0 + 0.15 * lat, 7.0, 5.0);
+                    let indian_ridge = 1500.0 * gauss2_earth(lat, lon, -26.0, 70.0, 16.0, 12.0);
+
+                    // Deep Subduction Trenches (Mariana, Kuril/Japan, Peru-Chile, Tonga-Kermadec, Java, Puerto Rico)
+                    let mariana = -4900.0 * gauss2_earth(lat, lon, 16.5, 146.5, 5.5, 1.6);
+                    let japan_kuril = -3400.0 * ridge_gauss(lat, lon, 32.0, 52.0, 143.5 + 0.55 * (lat - 36.0), 1.6, 2.5);
+                    let peru_chile = -3300.0 * ridge_gauss(lat, lon, -42.0, -4.0, -72.5 - 0.24 * (lat + 22.0).max(0.0), 1.5, 3.0);
+                    let tonga_kermadec = -3900.0 * ridge_gauss(lat, lon, -36.0, -15.0, -175.0, 1.6, 2.5);
+                    let java_trench = -2900.0 * gauss2_earth(lat, lon, -10.5, 108.0, 1.6, 9.0);
+                    let puerto_rico = -3100.0 * gauss2_earth(lat, lon, 19.6, -66.0, 1.2, 3.5);
+
+                    let abyssal_hills = 260.0 * coast_ramp * texture;
+                    let h_ocean = shelf_slope
+                        + coast_ramp * (mar + epr + indian_ridge + mariana + japan_kuril + peru_chile + tonga_kermadec + java_trench + puerto_rico)
+                        + abyssal_hills;
+                    out_row[c] = h_ocean.clamp(-9800.0, -4.0) as f32;
+                }
+            }
+        });
+
+    TrueEarthDemCache {
+        is_land,
+        elev_m,
+        ring_bboxes,
+    }
+}
+
+#[inline]
+fn get_true_earth_dem() -> &'static TrueEarthDemCache {
+    TRUE_EARTH_DEM.get_or_init(build_true_earth_dem)
+}
+
+#[inline]
+fn is_land_exact_vector(dem: &TrueEarthDemCache, lat: f64, lon: f64) -> bool {
+    if lat <= -86.5 {
+        return true;
+    }
+    let mut inside = false;
+    for (r_idx, ring) in CONTINENT_POLYLINES.iter().enumerate() {
+        let (min_la, max_la, min_lo, max_lo) = dem.ring_bboxes[r_idx];
+        if lat < min_la || lat > max_la || lon > max_lo {
+            continue;
+        }
+        // Note: if lon < min_lo, ray casting rightward (+lon) STILL crosses this ring's edges!
+        let _ = min_lo;
+        for seg in ring.windows(2) {
+            let (y1, x1) = seg[0];
+            let (y2, x2) = seg[1];
+            if (x1 - x2).abs() > 180.0 {
+                continue;
+            }
+            if (y1 > lat) != (y2 > lat) {
+                let x_cross = x1 + (lat - y1) * (x2 - x1) / (y2 - y1);
+                if lon < x_cross {
+                    inside = !inside;
+                }
+            }
+        }
+    }
+    inside
+}
+
+/// Returns `(d_elev_dx, d_elev_dy)` in `m/deg` from the cached `0.25°` True Earth DEM for hillshading.
+pub fn elevation_slope_m_per_deg(lat_deg: f64, lon_deg: f64) -> (f64, f64) {
+    let dem = get_true_earth_dem();
+    let lat = lat_deg.clamp(-89.875, 89.875);
+    let lon = ((lon_deg + 180.0).rem_euclid(360.0)) - 180.0;
+    let r = (((90.0 - lat) / 0.25) - 0.5).round().clamp(0.0, (DEM_H - 1) as f64) as usize;
+    let c = (((lon + 180.0) / 0.25) - 0.5).round().rem_euclid(DEM_W as f64) as usize;
+    let rn = r.saturating_sub(1);
+    let rs = (r + 1).min(DEM_H - 1);
+    let cw = if c == 0 { DEM_W - 1 } else { c - 1 };
+    let ce = if c + 1 == DEM_W { 0 } else { c + 1 };
+    let e_w = dem.elev_m[r * DEM_W + cw] as f64;
+    let e_e = dem.elev_m[r * DEM_W + ce] as f64;
+    let e_n = dem.elev_m[rn * DEM_W + c] as f64;
+    let e_s = dem.elev_m[rs * DEM_W + c] as f64;
+    ((e_e - e_w) / 0.5, (e_n - e_s) / 0.5)
+}
+
+/// True-Earth Natural-Earth-aligned planetary elevation field (meters above MSL).
+/// Uses a `OnceLock`-cached `0.25°` (`1440×720`) point-in-polygon DEM with exact coastal
+/// polygon refinement so land, ocean, shelves, trenches, and cordilleras align pixel-for-pixel
+/// with `CONTINENT_POLYLINES`.
+pub fn synthetic_planetary_elevation_m(lat_deg: f64, lon_deg: f64) -> f64 {
+    let dem = get_true_earth_dem();
+    let lat = lat_deg.clamp(-89.99, 89.99);
+    let lon = ((lon_deg + 180.0).rem_euclid(360.0)) - 180.0;
+
+    let fy = ((90.0 - lat) / 0.25) - 0.5;
+    let fx = ((lon + 180.0) / 0.25) - 0.5;
+    let r0 = fy.floor().clamp(0.0, (DEM_H - 1) as f64) as usize;
+    let r1 = (r0 + 1).min(DEM_H - 1);
+    let wy = (fy - r0 as f64).clamp(0.0, 1.0);
+    let c0_s = fx.floor() as isize;
+    let c0 = c0_s.rem_euclid(DEM_W as isize) as usize;
+    let c1 = (c0 + 1) % DEM_W;
+    let wx = (fx - (c0_s as f64)).clamp(0.0, 1.0);
+
+    let i00 = r0 * DEM_W + c0;
+    let i10 = r0 * DEM_W + c1;
+    let i01 = r1 * DEM_W + c0;
+    let i11 = r1 * DEM_W + c1;
+
+    let m00 = dem.is_land[i00];
+    let m10 = dem.is_land[i10];
+    let m01 = dem.is_land[i01];
+    let m11 = dem.is_land[i11];
+
+    if m00 == m10 && m00 == m01 && m00 == m11 {
+        let e00 = dem.elev_m[i00] as f64;
+        let e10 = dem.elev_m[i10] as f64;
+        let e01 = dem.elev_m[i01] as f64;
+        let e11 = dem.elev_m[i11] as f64;
+        let top = e00 * (1.0 - wx) + e10 * wx;
+        let bot = e01 * (1.0 - wx) + e11 * wx;
+        return top * (1.0 - wy) + bot * wy;
+    }
+
+    // Coastal transition cell: refine land/ocean exactly against CONTINENT_POLYLINES
+    let land_exact = is_land_exact_vector(dem, lat, lon);
+    let target = u8::from(land_exact);
+    let weights = [
+        (1.0 - wx) * (1.0 - wy),
+        wx * (1.0 - wy),
+        (1.0 - wx) * wy,
+        wx * wy,
+    ];
+    let idxs = [i00, i10, i01, i11];
+    let mut sum = 0.0_f64;
+    let mut w_sum = 0.0_f64;
+    for k in 0..4 {
+        if dem.is_land[idxs[k]] == target {
+            sum += (dem.elev_m[idxs[k]] as f64) * weights[k];
+            w_sum += weights[k];
+        }
+    }
+    if w_sum > 1e-6 {
+        let val = sum / w_sum;
+        if land_exact {
+            val.max(4.0)
+        } else {
+            val.min(-4.0)
+        }
+    } else if land_exact {
+        15.0
+    } else {
+        -15.0
+    }
+}
+
+/// Real-Earth ocean surface current SST signature (°C): Gulf Stream, Kuroshio, Warm Pool,
+/// Humboldt/Benguela/California coastal upwelling, and Equatorial Pacific Cold Tongue.
+#[inline]
+fn earth_sst_current_offset_c(lat: f64, lon: f64, enso_nino34: f64) -> f64 {
+    let gulf_stream = 4.4 * gauss2_earth(lat, lon, 37.0, -64.0, 6.0, 14.0)
+        + 3.6 * gauss2_earth(lat, lon, 53.0, -28.0, 9.5, 22.0);
+    let kuroshio = 4.0 * gauss2_earth(lat, lon, 33.5, 141.0, 6.5, 16.0);
+    let agulhas_brazil = 2.4 * gauss2_earth(lat, lon, -31.5, 32.5, 6.5, 7.5)
+        + 2.1 * gauss2_earth(lat, lon, -27.5, -43.5, 7.0, 8.0);
+    let warm_pool = 2.2 * gauss2_earth(lat, lon, 0.0, 128.0, 13.0, 28.0);
+
+    let cold_tongue_mod = (1.0 - 0.42 * enso_nino34).clamp(0.25, 1.8);
+    let eq_cold_tongue = -3.3 * cold_tongue_mod * gauss2_earth(lat, lon, 0.0, -112.0, 4.2, 32.0);
+    let humboldt = -4.2 * gauss2_earth(lat, lon, -15.5, -77.5, 13.5, 5.5);
+    let benguela = -3.4 * gauss2_earth(lat, lon, -22.0, 11.5, 10.0, 4.8);
+    let california = -3.0 * gauss2_earth(lat, lon, 34.5, -123.5, 10.5, 5.0);
+    let labrador_oyashio = -3.4 * gauss2_earth(lat, lon, 51.0, -49.0, 7.5, 9.0)
+        - 2.8 * gauss2_earth(lat, lon, 45.5, 152.0, 5.5, 9.0);
+
+    gulf_stream
+        + kuroshio
+        + agulhas_brazil
+        + warm_pool
+        + eq_cold_tongue
+        + humboldt
+        + benguela
+        + california
+        + labrador_oyashio
+}
+
+/// Real-Earth terrestrial humidity & biome moisture offset `(rh_offset_pct, sm_offset_m3m3)`.
+#[inline]
+fn earth_biome_humidity(lat: f64, lon: f64) -> (f64, f64) {
+    let humid = 1.00 * gauss2_earth(lat, lon, -4.0, -63.0, 9.5, 14.5) // Amazon
+        + 0.95 * gauss2_earth(lat, lon, 0.0, 21.0, 7.5, 9.5) // Congo
+        + 1.00 * gauss2_earth(lat, lon, -1.5, 120.0, 9.5, 22.0) // Maritime Continent
+        + 0.85 * gauss2_earth(lat, lon, 18.0, 92.0, 9.5, 15.0) // South/SE Asia Monsoon
+        + 0.72 * gauss2_earth(lat, lon, 7.0, -5.0, 5.0, 7.0) // West Africa Guinea Coast
+        + 0.72 * gauss2_earth(lat, lon, 48.0, -124.0, 7.0, 6.0) // Pacific NW
+        + 0.65 * gauss2_earth(lat, lon, 37.5, -82.0, 8.5, 11.0) // Eastern North America
+        + 0.68 * gauss2_earth(lat, lon, 49.5, 6.0, 7.5, 14.0) // Europe
+        + 0.62 * gauss2_earth(lat, lon, 58.0, 95.0, 7.5, 34.0) // Eurasian Boreal Taiga
+        + 0.58 * gauss2_earth(lat, lon, 57.0, -100.0, 7.5, 26.0); // Canadian Boreal
+
+    let arid = 1.18 * gauss2_earth(lat, lon, 23.0, 11.0, 8.5, 23.0) // Sahara
+        + 1.12 * gauss2_earth(lat, lon, 22.0, 46.0, 7.5, 11.0) // Arabia
+        + 0.96 * gauss2_earth(lat, lon, 40.5, 84.0, 6.0, 19.0) // Taklamakan / Gobi
+        + 0.95 * gauss2_earth(lat, lon, -24.0, 132.0, 7.0, 14.0) // Australian Outback
+        + 0.85 * gauss2_earth(lat, lon, 31.0, -112.0, 6.5, 8.5) // Sonora / Mojave
+        + 0.88 * gauss2_earth(lat, lon, -22.5, -69.0, 6.5, 3.8) // Atacama
+        + 0.84 * gauss2_earth(lat, lon, -23.0, 17.0, 7.0, 5.5) // Namib / Kalahari
+        + 0.72 * gauss2_earth(lat, lon, 7.0, 46.0, 5.5, 5.0); // Horn of Africa
+
+    (24.0 * humid - 36.0 * arid, 0.14 * humid - 0.17 * arid)
+}
+
+/// Real-Earth major river basin & delta discharge corridor signal (`m^3/s` boost).
+#[inline]
+fn earth_river_corridor_signal(lat: f64, lon: f64) -> f64 {
+    let amazon = 4800.0 * ridge_gauss(lat, lon, -5.5, 0.5, -60.0, 11.0, 2.5)
+        * (-((lat + 3.0) / 2.8).powi(2)).exp();
+    let congo = 2600.0 * gauss2_earth(lat, lon, -1.5, 19.5, 3.5, 5.5);
+    let mississippi = 2100.0 * ridge_gauss(lat, lon, 29.0, 44.0, -90.5, 2.6, 2.5);
+    let parana = 1900.0 * ridge_gauss(lat, lon, -34.5, -18.0, -58.5, 2.6, 2.5);
+    let yangtze = 2400.0 * gauss2_earth(lat, lon, 30.8, 114.0, 2.2, 7.0);
+    let ganges_brahmaputra = 2600.0 * gauss2_earth(lat, lon, 24.5, 87.5, 2.5, 5.5);
+    let mekong = 1750.0 * ridge_gauss(lat, lon, 10.0, 24.0, 104.0, 2.0, 2.2);
+    let nile = 1400.0 * ridge_gauss(lat, lon, 2.0, 31.0, 31.5, 1.8, 2.0);
+    let ob_yenisei_lena = 1650.0 * gauss2_earth(lat, lon, 62.0, 70.0, 4.5, 3.5)
+        + 1750.0 * gauss2_earth(lat, lon, 64.0, 89.0, 4.5, 3.5)
+        + 1650.0 * gauss2_earth(lat, lon, 65.0, 126.0, 4.5, 3.5);
+    let danube = 1100.0 * gauss2_earth(lat, lon, 45.8, 22.0, 2.0, 5.5);
+    let mackenzie = 1250.0 * ridge_gauss(lat, lon, 60.0, 68.5, -128.0, 2.4, 2.0);
+
+    amazon + congo + mississippi + parana + yangtze + ganges_brahmaputra + mekong + nile + ob_yenisei_lena + danube + mackenzie
 }
 
 #[inline]
@@ -2019,6 +2498,7 @@ pub struct ClimateSimulationEngine {
 
 impl ClimateSimulationEngine {
     pub fn new(schema: HubSchema, db: ClimateDatabase) -> Self {
+        let _ = get_true_earth_dem();
         Self { schema, db }
     }
 
@@ -2161,10 +2641,11 @@ impl ClimateSimulationEngine {
                         + enso_footprint;
 
                     let sst_eq = if is_ocean {
-                        (28.6 * phi.cos() - 3.5 * phi.sin().powi(2)
+                        (28.4 * phi.cos() - 3.5 * phi.sin().powi(2)
                             + 0.35 * seasonal_swing
                             + 0.72 * global_warming_over_preindustrial
-                            + 1.25 * enso_footprint)
+                            + 1.25 * enso_footprint
+                            + earth_sst_current_offset_c(lat, lon, enso_nino34))
                             .max(-1.85)
                     } else {
                         t2m_eq
@@ -2176,10 +2657,12 @@ impl ClimateSimulationEngine {
                         + 7.5 * phi.sin().powi(2) * wave_phase.sin()
                         + 3.8 * (6.0 * lam + 0.3 * cfg.day_of_year).cos();
 
+                    let (rh_biome_off, sm_biome_off) = earth_biome_humidity(lat, lon);
                     let rh_eq = (if is_ocean { 81.0 } else { 62.0 }
-                        - 22.0 * (2.0 * phi).sin().powi(2)
-                        + 10.0 * wave_phase.sin())
-                    .clamp(14.0, 97.0);
+                        - 20.0 * (2.0 * phi).sin().powi(2)
+                        + 8.0 * wave_phase.sin()
+                        + if is_ocean { 0.0 } else { rh_biome_off })
+                    .clamp(12.0, 97.0);
                     let p_surf = if elev_m > 0.0 {
                         mslp * (-elev_m / 8400.0).exp()
                     } else {
@@ -2190,9 +2673,10 @@ impl ClimateSimulationEngine {
                     let sm_eq = if is_ocean {
                         0.48
                     } else {
-                        (0.08 + 0.36 * (rh_eq / 100.0)
+                        (0.08 + 0.34 * (rh_eq / 100.0)
+                            + 0.45 * sm_biome_off
                             - 0.012 * global_warming_over_preindustrial)
-                            .clamp(0.03, 0.48)
+                            .clamp(0.025, 0.48)
                     };
                     let ice_eq = if is_ocean && sst_eq < 0.0 {
                         (0.028 * ((-t2m_eq).max(0.0) * 120.0).sqrt()).clamp(0.0, 4.8)
@@ -2806,13 +3290,15 @@ impl ClimateSimulationEngine {
         let aod_emission_eq: Vec<f32> = core_cells
             .par_iter()
             .map(|c| {
-                let sahara = 0.55
-                    * (-((c.lat - 21.0) / 10.0).powi(2) - ((c.lon - 8.0) / 26.0).powi(2)).exp();
-                let asia_ind = 0.42
-                    * (-((c.lat - 28.0) / 12.0).powi(2) - ((c.lon - 108.0) / 22.0).powi(2)).exp();
-                let wildfire_belt = 0.28
-                    * (-((c.lat - 45.0) / 9.0).powi(2) - ((c.lon + 120.0) / 16.0).powi(2)).exp();
-                (0.08 + sahara + asia_ind + wildfire_belt) as f32
+                let sahara_plume = 0.62 * gauss2_earth(c.lat, c.lon, 19.5, 4.0, 8.5, 22.0)
+                    + 0.34 * gauss2_earth(c.lat, c.lon, 15.5, -24.0, 6.0, 18.0); // Saharan Air Layer Atlantic export
+                let arabia_thar = 0.48 * gauss2_earth(c.lat, c.lon, 25.0, 56.0, 7.0, 13.0);
+                let asia_ind = 0.52 * gauss2_earth(c.lat, c.lon, 29.0, 110.0, 9.0, 14.0)
+                    + 0.45 * gauss2_earth(c.lat, c.lon, 26.5, 81.0, 5.5, 10.5);
+                let wildfire_belt = 0.34 * gauss2_earth(c.lat, c.lon, 47.0, -118.0, 8.0, 14.0)
+                    + 0.32 * gauss2_earth(c.lat, c.lon, -11.0, -56.0, 7.0, 11.0)
+                    + 0.30 * gauss2_earth(c.lat, c.lon, 60.0, 112.0, 7.5, 20.0);
+                (0.05 + sahara_plume + arabia_thar + asia_ind + wildfire_belt) as f32
             })
             .collect();
 
@@ -2916,13 +3402,85 @@ impl ClimateSimulationEngine {
                     // === GROUP 1: ATMOSPHERIC DYNAMICS & METEOROLOGY ===
                     "geo_multispectral_satellite" => {
                         v_level = cfg.atmospheric_level_hpa;
+                        let mut cloud_frac_vec = vec![0.0_f32; n_cells];
+                        let itcz_lat = 5.5 * seasonal_phase.cos();
+                        let day_phase = 0.24 * (cfg.day_of_year + cfg.hour_utc / 24.0);
                         for (i, c) in core_cells.iter().enumerate() {
-                            let cloud_frac = ((c.rh_pct - 55.0) / 45.0).clamp(0.0, 1.0);
-                            let tb_k = (c.t2m_c + 273.15)
-                                - 52.0 * cloud_frac
-                                - 12.0 * (c.precip_mm_hr.min(3.0));
-                            values[i] = tb_k as f32;
+                            let phi = c.lat.to_radians();
+                            let lam = c.lon.to_radians();
+
+                            // 1. Extratropical cyclone comma-head & frontal cloud shields tied to QGPV MSLP & baroclinic shear
+                            let cyc_low = ((1013.0 - c.mslp_hpa) / 18.0).clamp(0.0, 1.25);
+                            let grad_t = dt_dx_grid[i].hypot(dt_dy_grid[i]) * 1.0e6;
+                            let front_band = ((grad_t - 4.0) / 14.0).clamp(0.0, 1.0);
+                            let conv_lift = ((-c.div_v_s1 * 1.0e5) / 1.4).clamp(0.0, 1.0);
+                            let storm_track = (-((c.lat.abs() - 47.0) / 15.0).powi(2)).exp();
+                            let spiral_mod = 0.55
+                                + 0.45
+                                    * (6.0 * lam + 0.24 * c.lat - day_phase
+                                        + 0.08 * (qgpv_state.u2[i] as f64))
+                                        .sin();
+                            let cyclone_shield = (storm_track
+                                * (0.72 * cyc_low + 0.48 * front_band + 0.35 * conv_lift)
+                                * spiral_mod)
+                                .clamp(0.0, 1.0);
+
+                            // 2. ITCZ deep convective mesoscale clusters (cold overshooting IR tops)
+                            let itcz_env = (-((c.lat - itcz_lat) / 6.2).powi(2)).exp();
+                            let itcz_clusters = 0.5
+                                + 0.5
+                                    * (5.0 * lam - 0.5 * day_phase).sin()
+                                    * (9.0 * lam + 0.35 * c.lat).cos();
+                            let itcz_conv = (0.95 * itcz_env * (0.35 + 0.65 * itcz_clusters)
+                                + 0.25 * gauss2_earth(c.lat, c.lon, -2.0, -62.0, 9.0, 14.0)
+                                + 0.25 * gauss2_earth(c.lat, c.lon, 0.0, 122.0, 10.0, 22.0))
+                            .clamp(0.0, 1.0);
+
+                            // 3. Subtropical marine stratocumulus decks (eastern ocean boundaries)
+                            let stratus_deck = if c.is_ocean {
+                                (0.76 * gauss2_earth(c.lat, c.lon, 27.0, -126.0, 7.0, 8.0)
+                                    + 0.78 * gauss2_earth(c.lat, c.lon, -15.0, -82.0, 8.5, 7.5)
+                                    + 0.74 * gauss2_earth(c.lat, c.lon, -18.0, 6.0, 8.0, 7.5)
+                                    + 0.64 * gauss2_earth(c.lat, c.lon, 24.0, -22.0, 6.5, 6.5)
+                                    + 0.64 * gauss2_earth(c.lat, c.lon, -23.0, 107.0, 6.5, 6.5))
+                                .clamp(0.0, 0.85)
+                            } else {
+                                0.0
+                            };
+
+                            // 4. Suppress cloud fraction over subtropical anticyclones & arid deserts so clear sky is transparent
+                            let high_clear = ((c.mslp_hpa - 1017.0) / 10.0).clamp(0.0, 0.85);
+                            let arid_clear = if !c.is_ocean && c.rh_pct < 44.0 {
+                                ((44.0 - c.rh_pct) / 28.0).clamp(0.0, 0.90)
+                            } else {
+                                0.0
+                            };
+                            let moisture_gate = ((c.rh_pct - 42.0) / 36.0).clamp(0.15, 1.0);
+                            let raw_cf = (cyclone_shield
+                                .max(itcz_conv)
+                                .max(stratus_deck)
+                                + 0.22 * (c.precip_mm_hr / 2.5).clamp(0.0, 1.0))
+                                * moisture_gate
+                                * (1.0 - high_clear)
+                                * (1.0 - arid_clear);
+                            let cloud_frac = if raw_cf < 0.14 {
+                                0.0
+                            } else {
+                                ((raw_cf - 0.14) / 0.86).clamp(0.0, 1.0)
+                            };
+                            cloud_frac_vec[i] = cloud_frac as f32;
+
+                            // GOES Clean-IR brightness temperature (K): clear sky ~285-303 K, stratus ~272 K, cyclone/ITCZ tops ~205-238 K
+                            let clear_tb_k = (c.t2m_c + 273.15).clamp(245.0, 305.0);
+                            let convective_depth = (0.70 * itcz_conv + 0.80 * cyclone_shield).clamp(0.0, 1.0);
+                            let stratus_only = (stratus_deck * (1.0 - convective_depth)).clamp(0.0, 1.0);
+                            let cloud_top_k = 274.0 * stratus_only
+                                + (248.0 - 43.0 * convective_depth) * (1.0 - stratus_only);
+                            let tb_k = clear_tb_k * (1.0 - cloud_frac) + cloud_top_k * cloud_frac;
+                            let _ = phi;
+                            values[i] = tb_k.clamp(205.0, 305.0) as f32;
                         }
+                        u_vec = Some(cloud_frac_vec);
                     }
                     "volumetric_doppler_radar" => {
                         v_level = cfg.atmospheric_level_hpa;
@@ -3034,43 +3592,61 @@ impl ClimateSimulationEngine {
                     "column_co2_flux" => {
                         for (i, c) in core_cells.iter().enumerate() {
                             let nh_biosphere = if c.lat > 15.0 && !c.is_ocean {
-                                -4.5 * seasonal_phase.cos()
+                                -5.2 * seasonal_phase.cos()
                             } else {
-                                0.6
+                                0.5
                             };
-                            let anthro = if !c.is_ocean && (20.0..=55.0).contains(&c.lat) {
-                                2.8
+                            let tropical_sink = if !c.is_ocean && c.lat.abs() < 12.0 && c.soil_moisture > 0.24 {
+                                -2.4
                             } else {
                                 0.0
                             };
-                            values[i] = (base_co2_ppm + nh_biosphere + anthro) as f32;
+                            let anthro_plumes = 6.2 * gauss2_earth(c.lat, c.lon, 35.0, 116.0, 6.5, 10.0)
+                                + 4.8 * gauss2_earth(c.lat, c.lon, 40.5, -77.0, 5.5, 9.0)
+                                + 4.4 * gauss2_earth(c.lat, c.lon, 50.5, 7.0, 4.5, 9.5)
+                                + 3.8 * gauss2_earth(c.lat, c.lon, 27.0, 79.0, 5.0, 8.5);
+                            values[i] = (base_co2_ppm + nh_biosphere + tropical_sink + anthro_plumes) as f32;
                         }
                     }
                     "methane_plumes_background" => {
                         let ch4_base = 1935.0 + 38.0 * (df_co2 - 2.25);
                         for (i, c) in core_cells.iter().enumerate() {
                             let wetlands = if !c.is_ocean && c.lat.abs() < 15.0 {
-                                65.0 * c.soil_moisture
+                                75.0 * c.soil_moisture
+                            } else if !c.is_ocean && (55.0..=72.0).contains(&c.lat) {
+                                52.0 * (c.soil_moisture / 0.4).clamp(0.0, 1.0)
                             } else {
                                 0.0
                             };
-                            let basin_plumes = 95.0
-                                * (-((c.lat - 31.8) / 4.0).powi(2)
-                                    - ((c.lon + 102.5) / 5.0).powi(2))
-                                .exp()
-                                + 85.0
-                                    * (-((c.lat - 38.0) / 5.0).powi(2)
-                                        - ((c.lon - 54.0) / 6.0).powi(2))
-                                    .exp();
+                            let basin_plumes = 105.0 * gauss2_earth(c.lat, c.lon, 31.8, -102.5, 4.0, 5.0) // Permian
+                                + 95.0 * gauss2_earth(c.lat, c.lon, 38.2, 54.0, 4.5, 5.5) // Turkmenistan
+                                + 80.0 * gauss2_earth(c.lat, c.lon, 26.5, 83.0, 5.0, 9.5) // Indo-Gangetic rice/livestock
+                                + 72.0 * gauss2_earth(c.lat, c.lon, 31.0, 114.0, 5.5, 8.0) // East China rice/coal
+                                + 65.0 * gauss2_earth(c.lat, c.lon, 66.5, 72.0, 4.5, 8.0); // Yamal/W Siberia
                             let nh_grad = 42.0 * c.lat.to_radians().sin();
                             values[i] = (ch4_base + nh_grad + wetlands + basin_plumes) as f32;
                         }
                     }
                     "tropospheric_no2_so2" => {
                         for (i, c) in core_cells.iter().enumerate() {
+                            let urban_corridors = 1.05 * gauss2_earth(c.lat, c.lon, 36.0, 116.5, 5.5, 8.5) // North/East China
+                                + 0.90 * gauss2_earth(c.lat, c.lon, 50.8, 6.5, 4.0, 8.0) // Benelux/Ruhr/UK
+                                + 0.85 * gauss2_earth(c.lat, c.lon, 40.8, -75.5, 4.0, 7.5) // US NE Corridor
+                                + 0.80 * gauss2_earth(c.lat, c.lon, 27.5, 78.5, 4.5, 8.5) // Indo-Gangetic
+                                + 0.78 * gauss2_earth(c.lat, c.lon, 35.8, 138.0, 2.8, 4.0) // Tokyo-Osaka
+                                + 0.65 * gauss2_earth(c.lat, c.lon, 25.5, 51.0, 4.0, 5.5) // Persian Gulf
+                                + 0.60 * gauss2_earth(c.lat, c.lon, -26.2, 28.0, 3.0, 4.0) // Highveld
+                                + 0.55 * gauss2_earth(c.lat, c.lon, 34.0, -118.0, 2.8, 4.0); // LA Basin
+                            let shipping = if c.is_ocean {
+                                0.35 * gauss2_earth(c.lat, c.lon, 15.0, 42.0, 5.5, 4.5) // Red Sea
+                                    + 0.38 * gauss2_earth(c.lat, c.lon, 3.0, 102.0, 3.5, 5.5) // Malacca
+                                    + 0.28 * gauss2_earth(c.lat, c.lon, 50.0, -3.0, 2.5, 4.5) // English Channel
+                            } else {
+                                0.0
+                            };
                             let aod = aod_field[i] as f64;
-                            let urban_factor = if c.is_ocean { 0.18 } else { 1.4 };
-                            values[i] = (aod * urban_factor * 8.5e15) as f32;
+                            let base_bg = if c.is_ocean { 0.08 } else { 0.32 } * aod;
+                            values[i] = ((base_bg + urban_corridors + shipping) * 8.5e15) as f32;
                         }
                     }
                     "aerosol_optical_depth_speciated" => {
@@ -3178,11 +3754,17 @@ impl ClimateSimulationEngine {
                             if c.is_ocean {
                                 let subpolar =
                                     1.8 * (-((c.lat.abs() - 52.0) / 12.0).powi(2)).exp();
-                                let eq_upwelling = 0.95 * (-((c.lat / 4.5).powi(2))).exp();
-                                let coastal = if c.elev_m > -900.0 { 2.2 } else { 0.12 };
+                                let eq_upwelling = 1.15
+                                    * (-((c.lat / 4.5).powi(2))).exp()
+                                    * (0.4 + 0.6 * gauss2_earth(c.lat, c.lon, 0.0, -105.0, 6.0, 35.0));
+                                let coastal_upwelling = 1.9 * gauss2_earth(c.lat, c.lon, -13.0, -78.0, 9.0, 4.5)
+                                    + 1.6 * gauss2_earth(c.lat, c.lon, -22.0, 12.0, 8.0, 4.5)
+                                    + 1.5 * gauss2_earth(c.lat, c.lon, 15.0, 56.0, 7.0, 7.0)
+                                    + 1.4 * gauss2_earth(c.lat, c.lon, 35.0, -123.0, 8.0, 4.5);
+                                let coastal = if c.elev_m > -900.0 { 1.95 } else { 0.10 };
                                 // Stratification nutrient penalty under extreme SST warming
                                 let strat_damping = (1.0 - 0.025 * (c.sst_c - 24.0).max(0.0)).clamp(0.4, 1.0);
-                                values[i] = ((0.08 + subpolar + eq_upwelling + coastal) * strat_damping) as f32;
+                                values[i] = ((0.06 + subpolar + eq_upwelling + coastal_upwelling + coastal) * strat_damping) as f32;
                             } else {
                                 values[i] = f32::NAN;
                             }
@@ -3216,7 +3798,7 @@ impl ClimateSimulationEngine {
                                 let from_h = (c.sea_ice_h_m / 0.65 * 100.0).clamp(0.0, 100.0);
                                 values[i] = (0.5 * from_sst + 0.5 * from_h) as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
@@ -3225,15 +3807,16 @@ impl ClimateSimulationEngine {
                             values[i] = if c.is_ocean {
                                 c.sea_ice_h_m as f32
                             } else {
-                                0.0
+                                f32::NAN
                             };
                         }
                     }
                     "gravimetric_ice_sheet_mass_balance" => {
                         for (i, c) in core_cells.iter().enumerate() {
-                            let on_greenland =
-                                (60.0..=83.0).contains(&c.lat) && (-58.0..=-22.0).contains(&c.lon);
-                            let on_antarctica = c.lat < -68.0;
+                            let on_greenland = !c.is_ocean
+                                && (59.5..=84.0).contains(&c.lat)
+                                && (-73.5..=-11.5).contains(&c.lon);
+                            let on_antarctica = !c.is_ocean && c.lat < -63.0;
                             if on_greenland || on_antarctica {
                                 // Surface mass balance: snowfall accumulation minus positive-degree-day ablation
                                 let accum = c.precip_mm_hr * 24.0 * 0.35;
@@ -3242,15 +3825,15 @@ impl ClimateSimulationEngine {
                                     * (if c.elev_m < 1800.0 { 2.4 } else { 0.45 });
                                 values[i] = (accum - pdd_melt) as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
                     "alpine_glacier_velocity_rgi" => {
                         for (i, c) in core_cells.iter().enumerate() {
                             if !c.is_ocean
-                                && (c.elev_m > 2100.0 || c.lat.abs() > 64.0)
-                                && c.t2m_c < 4.0
+                                && (c.elev_m > 1950.0 || c.lat.abs() > 63.0)
+                                && c.t2m_c < 4.5
                             {
                                 let ice_temp_factor =
                                     (0.12 * (c.t2m_c + 10.0)).exp().clamp(0.2, 3.5);
@@ -3258,18 +3841,21 @@ impl ClimateSimulationEngine {
                                 values[i] =
                                     (42.0 * ice_temp_factor * relief).clamp(0.0, 650.0) as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
                     "permafrost_thermokarst_subsidence" => {
                         for (i, c) in core_cells.iter().enumerate() {
-                            if !c.is_ocean && c.lat > 52.0 {
+                            let is_greenland = (59.5..=84.0).contains(&c.lat)
+                                && (-73.5..=-11.5).contains(&c.lon)
+                                && c.elev_m > 900.0;
+                            if !c.is_ocean && c.lat > 52.0 && !is_greenland {
                                 let tdd = (c.t2m_c + 12.0).max(0.0) * 85.0;
                                 let thaw_m = (0.045 * tdd.sqrt()).clamp(0.0, 4.5);
                                 values[i] = thaw_m as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
@@ -3277,12 +3863,16 @@ impl ClimateSimulationEngine {
                     // === GROUP 5: TERRESTRIAL BIOSPHERE, HYDROLOGY & CARBON ===
                     "canopy_height_aboveground_biomass" => {
                         for (i, c) in core_cells.iter().enumerate() {
-                            if !c.is_ocean && c.t2m_c > -8.0 {
-                                let sm_factor = (c.soil_moisture / 0.36).clamp(0.0, 1.15).powi(2);
-                                let warmth = ((c.t2m_c + 8.0) / 34.0).clamp(0.0, 1.15);
-                                values[i] = (280.0 * sm_factor * warmth).clamp(0.0, 360.0) as f32;
+                            if !c.is_ocean {
+                                if c.t2m_c > -8.0 {
+                                    let sm_factor = ((c.soil_moisture - 0.04) / 0.32).clamp(0.0, 1.15).powi(2);
+                                    let warmth = ((c.t2m_c + 8.0) / 34.0).clamp(0.0, 1.15);
+                                    values[i] = (290.0 * sm_factor * warmth).clamp(0.0, 360.0) as f32;
+                                } else {
+                                    values[i] = 0.0;
+                                }
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
@@ -3290,12 +3880,12 @@ impl ClimateSimulationEngine {
                         for (i, c) in core_cells.iter().enumerate() {
                             if !c.is_ocean {
                                 let par = 0.48 * (c.shortwave_wm2.max(120.0));
-                                let root_water_stress = ((c.soil_moisture - 0.03) / 0.30).clamp(0.05, 1.0);
+                                let root_water_stress = ((c.soil_moisture - 0.04) / 0.30).clamp(0.02, 1.0);
                                 let thermal_opt = (-((c.t2m_c - 23.0) / 14.0).powi(2)).exp();
                                 let co2_fert = 1.0 + 0.18 * (base_co2_ppm / 380.0).ln();
                                 values[i] = (0.0085 * par * root_water_stress * thermal_opt * co2_fert) as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
@@ -3314,9 +3904,10 @@ impl ClimateSimulationEngine {
                                 let sat_frac = (c.soil_moisture / 0.48).clamp(0.0, 1.0);
                                 let direct_runoff = c.precip_mm_hr * 480.0 * (0.25 + 0.75 * sat_frac.powi(2));
                                 let baseflow = 320.0 * sat_frac.powi(3);
-                                values[i] = (direct_runoff + baseflow) as f32;
+                                let corridor = earth_river_corridor_signal(c.lat, c.lon) * (0.45 + 0.55 * sat_frac);
+                                values[i] = (direct_runoff + baseflow + corridor) as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                         if !raw_rivers.is_empty() && (cfg.sim_year - 2026.8).abs() < 2.0 {
@@ -3340,29 +3931,33 @@ impl ClimateSimulationEngine {
                             };
                             let assim = assimilate_3dvar_cg(&values, w, h, &pts, None, &var_cfg).analysis;
                             for (i, c) in core_cells.iter().enumerate() {
-                                values[i] = if c.is_ocean { 0.0 } else { assim[i].max(0.0) };
+                                values[i] = if c.is_ocean { f32::NAN } else { assim[i].max(0.0) };
                             }
                         }
                     }
                     "active_wildfires_frp_burn_severity" => {
                         for (i, c) in core_cells.iter().enumerate() {
-                            if !c.is_ocean && c.t2m_c > 8.0 {
-                                let wind = c.u10_ms.hypot(c.v10_ms);
-                                let fwi = canadian_fire_weather_index(
-                                    c.t2m_c,
-                                    c.rh_pct,
-                                    wind,
-                                    c.precip_mm_hr,
-                                );
-                                let fuel_load = ((c.soil_moisture - 0.025) / 0.12).clamp(0.15, 1.0);
-                                let frp_mw = if fwi > 24.0 {
-                                    (fwi - 24.0) * 4.2 * fuel_load
+                            if !c.is_ocean {
+                                if c.t2m_c > 8.0 {
+                                    let wind = c.u10_ms.hypot(c.v10_ms);
+                                    let fwi = canadian_fire_weather_index(
+                                        c.t2m_c,
+                                        c.rh_pct,
+                                        wind,
+                                        c.precip_mm_hr,
+                                    );
+                                    let fuel_load = ((c.soil_moisture - 0.03) / 0.12).clamp(0.05, 1.0);
+                                    let frp_mw = if fwi > 24.0 {
+                                        (fwi - 24.0) * 4.2 * fuel_load
+                                    } else {
+                                        0.0
+                                    };
+                                    values[i] = frp_mw as f32;
                                 } else {
-                                    0.0
-                                };
-                                values[i] = frp_mw as f32;
+                                    values[i] = 0.0;
+                                }
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                         if !raw_fires.is_empty() && (cfg.sim_year - 2026.8).abs() < 2.0 {
@@ -3379,7 +3974,7 @@ impl ClimateSimulationEngine {
                     "dynamic_land_cover_deforestation" => {
                         for (i, c) in core_cells.iter().enumerate() {
                             if c.is_ocean {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             } else if c.t2m_c < -6.0 {
                                 values[i] = 8.0;
                             } else if c.soil_moisture < 0.11 {
@@ -3411,15 +4006,19 @@ impl ClimateSimulationEngine {
                         let slr_m = ((global_warming_over_preindustrial - 0.9).max(0.0) * 0.32)
                             .clamp(0.05, 3.0);
                         for (i, c) in core_cells.iter().enumerate() {
-                            if !c.is_ocean && c.elev_m < 25.0 {
-                                let inv_baro_m = (1013.25 - c.mslp_hpa).max(0.0) * 0.01;
-                                let surge_100yr =
-                                    1.8 + 0.08 * c.u10_ms.hypot(c.v10_ms) + inv_baro_m;
-                                let flood_depth =
-                                    (slr_m + surge_100yr - c.elev_m * 0.12).max(0.0);
-                                values[i] = flood_depth as f32;
+                            if !c.is_ocean {
+                                if c.elev_m < 25.0 {
+                                    let inv_baro_m = (1013.25 - c.mslp_hpa).max(0.0) * 0.01;
+                                    let surge_100yr =
+                                        1.8 + 0.08 * c.u10_ms.hypot(c.v10_ms) + inv_baro_m;
+                                    let flood_depth =
+                                        (slr_m + surge_100yr - c.elev_m * 0.12).max(0.0);
+                                    values[i] = flood_depth as f32;
+                                } else {
+                                    values[i] = 0.0;
+                                }
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
@@ -3434,7 +4033,7 @@ impl ClimateSimulationEngine {
                                     c.precip_mm_hr,
                                 ) as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }
@@ -3454,12 +4053,15 @@ impl ClimateSimulationEngine {
                                     wind,
                                     c.precip_mm_hr,
                                 );
-                                let pop_weight = (-((c.lat.abs() - 32.0) / 24.0).powi(2)).exp();
+                                let pop_weight = (-((c.lat.abs() - 32.0) / 24.0).powi(2)).exp()
+                                    + 0.45 * gauss2_earth(c.lat, c.lon, 27.0, 82.0, 9.0, 14.0)
+                                    + 0.45 * gauss2_earth(c.lat, c.lon, 33.0, 114.0, 9.0, 12.0)
+                                    + 0.35 * gauss2_earth(c.lat, c.lon, 48.5, 8.0, 8.0, 14.0);
                                 let risk = (1.6 * (wbgt - 18.0).max(0.0) + 0.55 * fwi)
-                                    * (0.45 + 0.85 * pop_weight);
+                                    * (0.45 + 0.85 * pop_weight.min(1.35));
                                 values[i] = risk.clamp(0.0, 100.0) as f32;
                             } else {
-                                values[i] = 0.0;
+                                values[i] = f32::NAN;
                             }
                         }
                     }

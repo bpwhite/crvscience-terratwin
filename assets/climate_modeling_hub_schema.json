@@ -238,7 +238,7 @@
             "radial_velocity_shear",
             "echo_tops_km"
           ],
-          "defaultVisible": true,
+          "defaultVisible": false,
           "defaultOpacity": 0.85
         },
         {
@@ -257,7 +257,7 @@
           "verticalDimension": "surface_mslp",
           "units": "hPa",
           "defaultVisible": true,
-          "defaultOpacity": 1.0
+          "defaultOpacity": 0.75
         },
         {
           "id": "wind_vector_jet_streams",

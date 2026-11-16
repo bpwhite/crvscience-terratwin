@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -496,6 +497,17 @@ impl ClimateDatabase {
         if grids.is_empty() {
             return Ok(0);
         }
+        let packed_blobs: Vec<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)> = grids
+            .par_iter()
+            .map(|g| {
+                (
+                    pack_f32_compressed(&g.values),
+                    g.u_component.as_ref().map(|v| pack_f32_compressed(v)),
+                    g.v_component.as_ref().map(|v| pack_f32_compressed(v)),
+                )
+            })
+            .collect();
+
         let mut conn = self.conn.lock().expect("SQLite mutex poisoned");
         let tx = conn.transaction()?;
         let computed_at = chrono::Utc::now().to_rfc3339();
@@ -518,10 +530,7 @@ impl ClimateDatabase {
                     computed_at_utc = excluded.computed_at_utc",
             )?;
 
-            for g in grids {
-                let grid_bytes = pack_f32_compressed(&g.values);
-                let u_bytes = g.u_component.as_ref().map(|v| pack_f32_compressed(v));
-                let v_bytes = g.v_component.as_ref().map(|v| pack_f32_compressed(v));
+            for (g, (grid_bytes, u_bytes, v_bytes)) in grids.iter().zip(packed_blobs.iter()) {
                 stmt.execute(params![
                     &g.layer_id,
                     &g.scenario,
@@ -532,9 +541,9 @@ impl ClimateDatabase {
                     g.min_val as f64,
                     g.max_val as f64,
                     g.mean_val as f64,
-                    grid_bytes,
-                    u_bytes,
-                    v_bytes,
+                    grid_bytes.as_slice(),
+                    u_bytes.as_deref(),
+                    v_bytes.as_deref(),
                     &computed_at,
                 ])?;
             }

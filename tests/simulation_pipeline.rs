@@ -750,7 +750,17 @@ fn colormaps_palettes_and_all_34_schema_layers_render_valid_rgb() {
 
 #[test]
 fn coastlines_basins_and_reference_observatories_invariants() {
-    assert_eq!(CONTINENT_POLYLINES.len(), 7);
+    assert!(
+        CONTINENT_POLYLINES.len() >= 35,
+        "Expected Natural-Earth multi-ring coastlines (>= 35 rings), got {}",
+        CONTINENT_POLYLINES.len()
+    );
+    let total_vertices: usize = CONTINENT_POLYLINES.iter().map(|p| p.len()).sum();
+    assert!(
+        total_vertices >= 1800,
+        "Expected >= 1800 coastline vertices, got {}",
+        total_vertices
+    );
     for (idx, poly) in CONTINENT_POLYLINES.iter().enumerate() {
         assert!(poly.len() >= 10, "Continent {} must contain >= 10 vertices", idx);
         let first = poly.first().unwrap();

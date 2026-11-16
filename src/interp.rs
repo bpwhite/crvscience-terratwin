@@ -554,9 +554,24 @@ pub fn sample_grid_bilinear(
     let v01 = grid[y1 * width + x0];
     let v11 = grid[y1 * width + x1];
 
-    let top = v00 * (1.0 - wx) + v10 * wx;
-    let bot = v01 * (1.0 - wx) + v11 * wx;
-    top * (1.0 - wy) + bot * wy
+    // Normalize weights over finite neighbors so 1–3 NaN coastal masks do not poison valid values
+    let w00 = (1.0 - wx) * (1.0 - wy);
+    let w10 = wx * (1.0 - wy);
+    let w01 = (1.0 - wx) * wy;
+    let w11 = wx * wy;
+    let mut sum = 0.0_f32;
+    let mut w_sum = 0.0_f32;
+    for (val, w_ij) in [(v00, w00), (v10, w10), (v01, w01), (v11, w11)] {
+        if val.is_finite() {
+            sum += val * w_ij;
+            w_sum += w_ij;
+        }
+    }
+    if w_sum > 1.0e-6 {
+        sum / w_sum
+    } else {
+        f32::NAN
+    }
 }
 
 #[inline]
@@ -616,7 +631,7 @@ pub fn sample_grid_bicubic_monotone(
     let c01 = grid[y_idx[2] * width + x_idx[1]];
     let c11 = grid[y_idx[2] * width + x_idx[2]];
     if !c00.is_finite() || !c10.is_finite() || !c01.is_finite() || !c11.is_finite() {
-        return c00;
+        return sample_grid_bilinear(grid, width, height, lat, lon);
     }
 
     let local_min = c00.min(c10).min(c01).min(c11) as f64;

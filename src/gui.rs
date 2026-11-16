@@ -29,14 +29,19 @@
 //!   1950-2100 timeline scrubber, Play/Pause animation, and SQLite/Rayon telemetry status bar.
 
 use crate::coastlines::{CONTINENT_POLYLINES, REFERENCE_OBSERVATORIES, TELECONNECTION_BASINS};
-use crate::colormaps::{default_layer_style, shade_basemap_rgb, ColormapPalette};
+use crate::colormaps::{
+    default_layer_style, shade_basemap_with_slope_rgb, ColormapPalette,
+};
 use crate::interp::{
     detect_mslp_extrema, detect_thermal_fronts, extract_marching_squares_contours,
     fibonacci_sphere_points, haversine_km, project_latlon_to_ndc, sample_grid_bilinear,
     unproject_ndc_to_latlon, CameraState, ContourSegment, FrontSegment, MapProjectionKind,
     PressureExtrema,
 };
-use crate::physics::{synthetic_planetary_elevation_m, ClimateSimulationEngine, SimulationConfig};
+use crate::physics::{
+    elevation_slope_m_per_deg, synthetic_planetary_elevation_m, ClimateSimulationEngine,
+    SimulationConfig,
+};
 use crate::schema::SspScenario;
 use crate::worker::{RunningWorkers, TelemetrySnapshot};
 use anyhow::Result;
@@ -88,6 +93,7 @@ pub struct TerraTwinGuiApp {
     export_status_msg: String,
 
     layer_states: HashMap<String, LayerUiState>,
+    solo_restore_vis: Option<HashMap<String, bool>>,
     particles: Vec<LagrangianParticle>,
     map_texture: Option<TextureHandle>,
     cached_snapshot: Option<TelemetrySnapshot>,
@@ -177,6 +183,7 @@ impl TerraTwinGuiApp {
             last_timeline_refresh: std::time::Instant::now() - std::time::Duration::from_secs(10),
             export_status_msg: String::new(),
             layer_states,
+            solo_restore_vis: None,
             particles,
             map_texture: None,
             cached_snapshot: None,
@@ -367,6 +374,12 @@ impl TerraTwinGuiApp {
         let mut active_layers = Vec::new();
         if let Some(ref snap) = self.cached_snapshot {
             for (_, layer_spec) in self.workers.coordinator.schema().all_layers() {
+                // Vector-only layers render strictly as contours/polygons in render_central_map, never as opaque raster
+                if layer_spec.id == "synoptic_fronts_isobars"
+                    || layer_spec.id == "teleconnection_oscillation_masks"
+                {
+                    continue;
+                }
                 if let Some(ui_st) = self.layer_states.get(&layer_spec.id) {
                     if ui_st.visible {
                         if let Some(g) = snap.grids.get(&layer_spec.id) {
@@ -398,12 +411,52 @@ impl TerraTwinGuiApp {
                     };
 
                     let elev_m = synthetic_planetary_elevation_m(lat, lon);
-                    let base_rgb = shade_basemap_rgb(&basemap_id, lat, lon, elev_m);
+                    let is_ocean_px = elev_m < 0.0;
+                    let (dx_elev, dy_elev) = elevation_slope_m_per_deg(lat, lon);
+                    let base_rgb = shade_basemap_with_slope_rgb(
+                        &basemap_id,
+                        lat,
+                        lon,
+                        elev_m,
+                        dx_elev,
+                        dy_elev,
+                    );
                     let mut r = base_rgb[0] as f32;
                     let mut g = base_rgb[1] as f32;
                     let mut b = base_rgb[2] as f32;
 
                     for lyr in &active_layers {
+                        let id = lyr.grid.layer_id.as_str();
+                        let ocean_only = matches!(
+                            id,
+                            "sst_marine_heatwaves"
+                                | "subsurface_ocean_heat_salinity_3d"
+                                | "thermohaline_currents_amoc"
+                                | "swot_sea_surface_height_altimetry"
+                                | "ocean_acidification_carbonate"
+                                | "marine_chlorophyll_hypoxia"
+                                | "sea_ice_concentration_drift"
+                                | "sea_ice_thickness_freeboard_age"
+                        );
+                        let land_only = matches!(
+                            id,
+                            "gravimetric_ice_sheet_mass_balance"
+                                | "alpine_glacier_velocity_rgi"
+                                | "permafrost_thermokarst_subsidence"
+                                | "canopy_height_aboveground_biomass"
+                                | "sif_photosynthesis_evaporative_stress"
+                                | "soil_moisture_groundwater_grace"
+                                | "swot_surface_water_river_discharge"
+                                | "active_wildfires_frp_burn_severity"
+                                | "dynamic_land_cover_deforestation"
+                                | "coastal_inundation_storm_surge"
+                                | "compound_hazard_fire_weather_index"
+                                | "critical_infrastructure_socioeconomic_exposure"
+                        );
+                        if (ocean_only && !is_ocean_px) || (land_only && is_ocean_px) {
+                            continue;
+                        }
+
                         let raw_val = sample_grid_bilinear(
                             &lyr.grid.values,
                             lyr.grid.width,
@@ -415,15 +468,47 @@ impl TerraTwinGuiApp {
                             continue;
                         }
                         // Skip near-zero transparent sparse fields (radar dBZ, lightning, fires, sea ice, flood, permafrost, ice sheets)
-                        if (lyr.grid.layer_id == "volumetric_doppler_radar" && raw_val < 5.0)
-                            || (lyr.grid.layer_id == "sea_ice_concentration_drift" && raw_val < 8.0)
-                            || (lyr.grid.layer_id == "sea_ice_thickness_freeboard_age" && raw_val < 0.08)
-                            || (lyr.grid.layer_id == "permafrost_thermokarst_subsidence" && raw_val < 0.08)
-                            || (lyr.grid.layer_id == "gravimetric_ice_sheet_mass_balance" && raw_val.abs() < 1.5)
-                            || (lyr.grid.layer_id == "active_wildfires_frp_burn_severity" && raw_val < 2.0)
-                            || (lyr.grid.layer_id == "coastal_inundation_storm_surge" && raw_val < 0.08)
+                        if (id == "volumetric_doppler_radar" && raw_val < 5.0)
+                            || (id == "sea_ice_concentration_drift" && raw_val < 8.0)
+                            || (id == "sea_ice_thickness_freeboard_age" && raw_val < 0.08)
+                            || (id == "permafrost_thermokarst_subsidence" && raw_val < 0.08)
+                            || (id == "gravimetric_ice_sheet_mass_balance" && raw_val.abs() < 1.5)
+                            || (id == "active_wildfires_frp_burn_severity" && raw_val < 2.0)
+                            || (id == "coastal_inundation_storm_surge" && raw_val < 0.08)
                         {
                             continue;
+                        }
+
+                        let mut alpha = lyr.opacity.clamp(0.0, 1.0);
+                        if id == "geo_multispectral_satellite" {
+                            let cloud_frac = if let Some(ref cf_arr) = lyr.grid.u_component {
+                                sample_grid_bilinear(
+                                    cf_arr,
+                                    lyr.grid.width,
+                                    lyr.grid.height,
+                                    lat,
+                                    lon,
+                                )
+                            } else {
+                                ((288.0 - raw_val) / 48.0).clamp(0.0, 1.0)
+                            };
+                            if !cloud_frac.is_finite() || cloud_frac < 0.08 {
+                                continue;
+                            }
+                            let cf_norm = ((cloud_frac - 0.08) / 0.92).clamp(0.0, 1.0);
+                            alpha *= cf_norm.powf(0.85);
+                        } else if id == "wind_vector_jet_streams" {
+                            let jet_mask = ((raw_val - 16.0) / 28.0).clamp(0.0, 1.0);
+                            if jet_mask <= 0.02 {
+                                continue;
+                            }
+                            alpha *= jet_mask * 0.72;
+                        } else if id == "atmospheric_rivers_ivt" {
+                            let ivt_mask = ((raw_val - 220.0) / 400.0).clamp(0.0, 1.0);
+                            if ivt_mask <= 0.02 {
+                                continue;
+                            }
+                            alpha *= ivt_mask;
                         }
 
                         let (norm, pal) = if anomaly_mode {
@@ -439,7 +524,6 @@ impl TerraTwinGuiApp {
                         };
 
                         let c_rgb = pal.sample_rgb(norm);
-                        let alpha = lyr.opacity.clamp(0.0, 1.0);
                         r = r * (1.0 - alpha) + (c_rgb[0] as f32) * alpha;
                         g = g * (1.0 - alpha) + (c_rgb[1] as f32) * alpha;
                         b = b * (1.0 - alpha) + (c_rgb[2] as f32) * alpha;
@@ -650,6 +734,8 @@ impl TerraTwinGuiApp {
 
                 ui.separator();
                 let groups = self.workers.coordinator.schema().layer_groups.clone();
+                let mut solo_clicked_id: Option<String> = None;
+                let visible_count = self.layer_states.values().filter(|s| s.visible).count();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for grp in &groups {
                         let has_vis = grp.layers.iter().any(|l| {
@@ -672,10 +758,18 @@ impl TerraTwinGuiApp {
                                 let Some(st) = self.layer_states.get_mut(&lyr.id) else {
                                     continue;
                                 };
+                                let is_soloed = st.visible && visible_count == 1;
                                 ui.group(|ui| {
                                     ui.horizontal(|ui| {
                                         if ui.checkbox(&mut st.visible, &lyr.name).changed() {
                                             self.raster_dirty = true;
+                                        }
+                                        if ui
+                                            .selectable_label(is_soloed, "👁 Solo")
+                                            .on_hover_text("Solo: show only this layer (click again to restore)")
+                                            .clicked()
+                                        {
+                                            solo_clicked_id = Some(lyr.id.clone());
                                         }
                                         ui.menu_button("Info", |ui| {
                                             ui.set_max_width(300.0);
@@ -729,6 +823,34 @@ impl TerraTwinGuiApp {
                         });
                     }
                 });
+                if let Some(target_id) = solo_clicked_id {
+                    let currently_solo = self
+                        .layer_states
+                        .get(&target_id)
+                        .map(|s| s.visible)
+                        .unwrap_or(false)
+                        && visible_count == 1;
+                    if currently_solo {
+                        if let Some(prev) = self.solo_restore_vis.take() {
+                            for (id, st) in &mut self.layer_states {
+                                if let Some(&v) = prev.get(id) {
+                                    st.visible = v;
+                                }
+                            }
+                        }
+                    } else {
+                        let prev: HashMap<String, bool> = self
+                            .layer_states
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.visible))
+                            .collect();
+                        self.solo_restore_vis = Some(prev);
+                        for (id, st) in &mut self.layer_states {
+                            st.visible = *id == target_id;
+                        }
+                    }
+                    self.raster_dirty = true;
+                }
             });
     }
 
@@ -1025,9 +1147,9 @@ impl TerraTwinGuiApp {
                     }
                 }
 
-                // Re-rasterize composite texture when dirty (adaptive 420x240 buffer for crisp fluid interaction)
-                let tex_w = ((rect.width() * 0.42) as usize).clamp(240, 560);
-                let tex_h = ((rect.height() * 0.42) as usize).clamp(140, 340);
+                // Re-rasterize composite texture when dirty (0.85x viewport buffer for crisp Natural Earth coastlines & cloud detail)
+                let tex_w = ((rect.width() * 0.85) as usize).clamp(480, 1120);
+                let tex_h = ((rect.height() * 0.85) as usize).clamp(300, 760);
                 if self.raster_dirty || self.map_texture.is_none() {
                     self.rebuild_composite_texture(ctx, tex_w, tex_h);
                 }
@@ -1108,86 +1230,7 @@ impl TerraTwinGuiApp {
                     }
                 }
 
-                // Vector Continental Coastlines
-                let coast_stroke =
-                    Stroke::new(1.25_f32, Color32::from_rgba_unmultiplied(215, 232, 248, 175));
-                for poly in CONTINENT_POLYLINES {
-                    let mut prev: Option<Pos2> = None;
-                    for &(lat, lon) in *poly {
-                        if let Some((nx, ny)) = project_latlon_to_ndc(
-                            self.projection,
-                            &self.camera,
-                            lat,
-                            lon,
-                            0.0,
-                            aspect,
-                        ) {
-                            let pt = ndc_to_screen(nx, ny);
-                            if let Some(p0) = prev {
-                                if p0.distance(pt) < rect.width() * 0.35 {
-                                    painter.line_segment([p0, pt], coast_stroke);
-                                }
-                            }
-                            prev = Some(pt);
-                        } else {
-                            prev = None;
-                        }
-                    }
-                }
-
-                // Teleconnection Basin Bounding Polygons
-                if self
-                    .layer_states
-                    .get("teleconnection_oscillation_masks")
-                    .map(|s| s.visible)
-                    .unwrap_or(false)
-                {
-                    let mask_stroke = Stroke::new(1.6_f32, Color32::from_rgb(255, 215, 85));
-                    for &(_, label, min_la, max_la, min_lo, max_lo) in TELECONNECTION_BASINS {
-                        let corners = [
-                            (min_la, min_lo),
-                            (min_la, max_lo),
-                            (max_la, max_lo),
-                            (max_la, min_lo),
-                            (min_la, min_lo),
-                        ];
-                        let mut prev: Option<Pos2> = None;
-                        for &(la, lo) in &corners {
-                            if let Some((nx, ny)) = project_latlon_to_ndc(
-                                self.projection,
-                                &self.camera,
-                                la,
-                                lo,
-                                0.0,
-                                aspect,
-                            ) {
-                                let pt = ndc_to_screen(nx, ny);
-                                if let Some(p0) = prev {
-                                    painter.line_segment([p0, pt], mask_stroke);
-                                }
-                                prev = Some(pt);
-                            }
-                        }
-                        if let Some((nx, ny)) = project_latlon_to_ndc(
-                            self.projection,
-                            &self.camera,
-                            0.5 * (min_la + max_la),
-                            0.5 * (min_lo + max_lo),
-                            0.0,
-                            aspect,
-                        ) {
-                            painter.text(
-                                ndc_to_screen(nx, ny),
-                                Align2::CENTER_CENTER,
-                                label,
-                                FontId::monospace(10.5),
-                                Color32::from_rgb(255, 232, 130),
-                            );
-                        }
-                    }
-                }
-
-                // Marching-Squares 4 hPa MSLP Isobars, Thermal Fronts & L/H Cyclone Centers
+                // Marching-Squares 4 hPa MSLP Isobars (thin translucent cyan-slate below coastlines) & Thermal Fronts
                 if self
                     .layer_states
                     .get("synoptic_fronts_isobars")
@@ -1195,9 +1238,9 @@ impl TerraTwinGuiApp {
                     .unwrap_or(false)
                 {
                     let iso_thin =
-                        Stroke::new(0.95_f32, Color32::from_rgba_unmultiplied(235, 244, 255, 145));
+                        Stroke::new(0.85_f32, Color32::from_rgba_unmultiplied(125, 205, 240, 112));
                     let iso_major =
-                        Stroke::new(1.75_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 205));
+                        Stroke::new(1.15_f32, Color32::from_rgba_unmultiplied(168, 228, 255, 160));
                     for seg in &self.cached_isobars {
                         if let (Some((nx1, ny1)), Some((nx2, ny2))) = (
                             project_latlon_to_ndc(
@@ -1231,9 +1274,9 @@ impl TerraTwinGuiApp {
                     }
 
                     let cold_stroke =
-                        Stroke::new(2.1_f32, Color32::from_rgba_unmultiplied(70, 175, 255, 225));
+                        Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(70, 175, 255, 215));
                     let warm_stroke =
-                        Stroke::new(2.1_f32, Color32::from_rgba_unmultiplied(255, 90, 75, 225));
+                        Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(255, 90, 75, 215));
                     for fseg in &self.cached_fronts {
                         if let (Some((nx1, ny1)), Some((nx2, ny2))) = (
                             project_latlon_to_ndc(
@@ -1298,6 +1341,93 @@ impl TerraTwinGuiApp {
                                 FontId::monospace(9.5),
                                 Color32::from_rgb(235, 242, 252),
                             );
+                        }
+                    }
+                }
+
+                // Teleconnection Basin Bounding Polygons
+                if self
+                    .layer_states
+                    .get("teleconnection_oscillation_masks")
+                    .map(|s| s.visible)
+                    .unwrap_or(false)
+                {
+                    let mask_stroke = Stroke::new(1.6_f32, Color32::from_rgb(255, 215, 85));
+                    for &(_, label, min_la, max_la, min_lo, max_lo) in TELECONNECTION_BASINS {
+                        let corners = [
+                            (min_la, min_lo),
+                            (min_la, max_lo),
+                            (max_la, max_lo),
+                            (max_la, min_lo),
+                            (min_la, min_lo),
+                        ];
+                        let mut prev: Option<Pos2> = None;
+                        for &(la, lo) in &corners {
+                            if let Some((nx, ny)) = project_latlon_to_ndc(
+                                self.projection,
+                                &self.camera,
+                                la,
+                                lo,
+                                0.0,
+                                aspect,
+                            ) {
+                                let pt = ndc_to_screen(nx, ny);
+                                if let Some(p0) = prev {
+                                    painter.line_segment([p0, pt], mask_stroke);
+                                }
+                                prev = Some(pt);
+                            }
+                        }
+                        if let Some((nx, ny)) = project_latlon_to_ndc(
+                            self.projection,
+                            &self.camera,
+                            0.5 * (min_la + max_la),
+                            0.5 * (min_lo + max_lo),
+                            0.0,
+                            aspect,
+                        ) {
+                            painter.text(
+                                ndc_to_screen(nx, ny),
+                                Align2::CENTER_CENTER,
+                                label,
+                                FontId::monospace(10.5),
+                                Color32::from_rgb(255, 232, 130),
+                            );
+                        }
+                    }
+                }
+
+                // Vector Continental Coastlines (rendered ABOVE raster overlays & isobars: 2.8px dark obsidian casing + 1.35px warm gold/ivory shoreline)
+                let coast_casing =
+                    Stroke::new(2.8_f32, Color32::from_rgba_unmultiplied(8, 12, 20, 235));
+                let coast_stroke =
+                    Stroke::new(1.35_f32, Color32::from_rgba_unmultiplied(245, 226, 172, 242));
+                for pass in 0..2 {
+                    let stroke = if pass == 0 { coast_casing } else { coast_stroke };
+                    for poly in CONTINENT_POLYLINES {
+                        let mut prev: Option<(Pos2, f64, f64)> = None;
+                        for &(lat, lon) in *poly {
+                            if let Some((nx, ny)) = project_latlon_to_ndc(
+                                self.projection,
+                                &self.camera,
+                                lat,
+                                lon,
+                                0.0,
+                                aspect,
+                            ) {
+                                let pt = ndc_to_screen(nx, ny);
+                                if let Some((p0, la0, lo0)) = prev {
+                                    let is_polar_seam = (la0 < -89.5 && lat < -89.5)
+                                        || ((lo0.abs() > 179.9 && lon.abs() > 179.9)
+                                            && (la0 < -80.0 || lat < -80.0));
+                                    if !is_polar_seam && p0.distance(pt) < rect.width() * 0.35 {
+                                        painter.line_segment([p0, pt], stroke);
+                                    }
+                                }
+                                prev = Some((pt, lat, lon));
+                            } else {
+                                prev = None;
+                            }
                         }
                     }
                 }
@@ -1838,6 +1968,15 @@ pub fn render_headless_screenshot(
     egui_ctx.set_pixels_per_point(1.0);
     let mut app = TerraTwinGuiApp::new_headless(workers);
 
+    // Wait for initial 288x144 Rayon simulation snapshot across all view presets
+    for _ in 0..45 {
+        if app.workers.coordinator.latest_snapshot().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    app.raster_dirty = true;
+
     if view == 2 {
         app.projection = MapProjectionKind::Equirectangular2d;
         app.camera.center_lon = 0.0;
@@ -1860,12 +1999,6 @@ pub fn render_headless_screenshot(
             if let Some(st) = app.layer_states.get_mut(id) {
                 st.visible = true;
                 st.opacity = op;
-            }
-        }
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if app.workers.coordinator.latest_snapshot().is_some() {
-                break;
             }
         }
         app.raster_dirty = true;
@@ -1899,7 +2032,7 @@ pub fn render_headless_screenshot(
             }
         }
         app.push_sim_update();
-        for _ in 0..25 {
+        for _ in 0..45 {
             std::thread::sleep(std::time::Duration::from_millis(120));
             if let Some(snap) = app.workers.coordinator.latest_snapshot() {
                 if snap.config.scenario == SspScenario::Ssp5_85
@@ -1910,6 +2043,7 @@ pub fn render_headless_screenshot(
                 }
             }
         }
+        app.raster_dirty = true;
     }
 
     let warmup_delays_ms = [350u64, 250, 150, 150];
