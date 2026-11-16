@@ -1,5 +1,7 @@
 # TerraTwin HPC Climate Modeling & Telemetry Hub (`v2.5.0`)
 
+![TerraTwin Headless Workbench](validation/headless_screenshot.png)
+
 A native Rust **headless background daemon + desktop global map GUI** (`terratwin`) paired with a standalone **HTML5 interactive browser workstation** (`web/terratwin_live_preview.html`), implementing the complete `climate_modeling_hub_schema.json` specification across **6 layer groups and 34 predictive layers** from `1950` to `2100`.
 
 ## Build & Run Quickstart

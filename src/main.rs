@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! Unified binary entrypoint (`terratwin`) supporting both:
 //! 1. **Native Desktop Global Map GUI + Background Worker Threads** (`terratwin` or `terratwin gui`)
 //! 2. **Native Headless Background Daemon & CLI Utilities** (`terratwin --headless`, `terratwin daemon`,
@@ -33,6 +48,16 @@ struct Cli {
     /// Force headless background daemon mode without opening a GUI window
     #[arg(long, default_value_t = false)]
     headless: bool,
+
+    /// Render an offscreen 1600x1000 RGBA PNG screenshot without opening a GUI window
+    #[arg(long, value_name = "PATH", global = true)]
+    #[allow(dead_code)]
+    screenshot: Option<PathBuf>,
+
+    /// Headless screenshot view preset (1 = Default 3D Globe, 2 = 2D Equirectangular Cryosphere, 3 = SSP5-8.5 Ocean & CMIP6)
+    #[arg(long, default_value_t = 1, value_name = "VIEW", global = true)]
+    #[allow(dead_code)]
+    screenshot_view: u8,
 
     /// Default SSP climate forcing scenario (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5)
     #[arg(long, default_value = "SSP2-4.5", global = true)]
@@ -299,7 +324,15 @@ fn main() -> Result<()> {
                     Duration::from_secs(300),
                     Duration::from_secs(45),
                 );
-                terratwin_climate_hub::gui::launch_native_gui(workers)
+                if let Some(ref out_path) = cli.screenshot {
+                    terratwin_climate_hub::gui::render_headless_screenshot(
+                        workers,
+                        out_path,
+                        cli.screenshot_view,
+                    )
+                } else {
+                    terratwin_climate_hub::gui::launch_native_gui(workers)
+                }
             }
             #[cfg(not(feature = "gui"))]
             {

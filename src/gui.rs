@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! Native desktop GUI (`eframe` / `egui`) implementing `climate_modeling_hub_schema.json`:
 //! - Top Bar: Global Anomaly Ticker, Projection Switcher (`EPSG:4978`, `EPSG:4326`, `EPSG:3995`, `EPSG:3031`),
 //!   SSP Scenario Selector, Coordinate Geocoder/Jump bar, Crosshair & Transect toggles, and 4 Live Readouts.
@@ -81,10 +96,15 @@ pub struct TerraTwinGuiApp {
     cached_fronts: Vec<FrontSegment>,
     raster_dirty: bool,
     last_raster_gen_key: u64,
+    open_visible_groups_only: bool,
 }
 
 impl TerraTwinGuiApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, workers: RunningWorkers) -> Self {
+        Self::new_headless(workers)
+    }
+
+    pub fn new_headless(workers: RunningWorkers) -> Self {
         let schema = workers.coordinator.schema().clone();
         let db = workers.coordinator.db().clone();
         let sim_engine_local = ClimateSimulationEngine::new(schema.clone(), db);
@@ -165,6 +185,7 @@ impl TerraTwinGuiApp {
             cached_fronts: Vec::new(),
             raster_dirty: true,
             last_raster_gen_key: 0,
+            open_visible_groups_only: false,
         }
     }
 
@@ -393,9 +414,12 @@ impl TerraTwinGuiApp {
                         if !raw_val.is_finite() {
                             continue;
                         }
-                        // Skip near-zero transparent sparse fields (radar dBZ, lightning, fires, sea ice, flood)
+                        // Skip near-zero transparent sparse fields (radar dBZ, lightning, fires, sea ice, flood, permafrost, ice sheets)
                         if (lyr.grid.layer_id == "volumetric_doppler_radar" && raw_val < 5.0)
                             || (lyr.grid.layer_id == "sea_ice_concentration_drift" && raw_val < 8.0)
+                            || (lyr.grid.layer_id == "sea_ice_thickness_freeboard_age" && raw_val < 0.08)
+                            || (lyr.grid.layer_id == "permafrost_thermokarst_subsidence" && raw_val < 0.08)
+                            || (lyr.grid.layer_id == "gravimetric_ice_sheet_mass_balance" && raw_val.abs() < 1.5)
                             || (lyr.grid.layer_id == "active_wildfires_frp_burn_severity" && raw_val < 2.0)
                             || (lyr.grid.layer_id == "coastal_inundation_storm_surge" && raw_val < 0.08)
                         {
@@ -628,10 +652,21 @@ impl TerraTwinGuiApp {
                 let groups = self.workers.coordinator.schema().layer_groups.clone();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for grp in &groups {
+                        let has_vis = grp.layers.iter().any(|l| {
+                            self.layer_states
+                                .get(&l.id)
+                                .map(|s| s.visible)
+                                .unwrap_or(false)
+                        });
+                        let is_open = if self.open_visible_groups_only {
+                            has_vis
+                        } else {
+                            grp.default_expanded
+                        };
                         egui::CollapsingHeader::new(
                             egui::RichText::new(&grp.group_name).strong(),
                         )
-                        .default_open(grp.default_expanded)
+                        .default_open(is_open)
                         .show(ui, |ui| {
                             for lyr in &grp.layers {
                                 let Some(st) = self.layer_states.get_mut(&lyr.id) else {
@@ -1389,8 +1424,8 @@ impl TerraTwinGuiApp {
     }
 }
 
-impl eframe::App for TerraTwinGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl TerraTwinGuiApp {
+    pub fn ui_step(&mut self, ctx: &egui::Context) {
         if self.last_timeline_refresh.elapsed() > std::time::Duration::from_secs(3) {
             self.refresh_playback_timestamps();
         }
@@ -1437,6 +1472,12 @@ impl eframe::App for TerraTwinGuiApp {
         self.render_central_map(ctx);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(45));
+    }
+}
+
+impl eframe::App for TerraTwinGuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_step(ctx);
     }
 }
 
@@ -1608,15 +1649,25 @@ fn draw_transect_profile(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 20, 32));
     let Some(snap) = snap_opt else { return };
+    let n = 48usize;
     let Some((id, grid)) = snap
         .grids
         .iter()
-        .find(|(id, _)| layer_states.get(*id).map(|s| s.visible).unwrap_or(false))
+        .filter(|(id, _)| layer_states.get(*id).map(|s| s.visible).unwrap_or(false))
+        .max_by_key(|(_, g)| {
+            (0..n)
+                .filter(|&i| {
+                    let t = i as f64 / (n - 1) as f64;
+                    let la = a.0 + (b.0 - a.0) * t;
+                    let lo = a.1 + (b.1 - a.1) * t;
+                    sample_grid_bilinear(&g.values, g.width, g.height, la, lo).is_finite()
+                })
+                .count()
+        })
     else {
         return;
     };
 
-    let n = 48usize;
     let mut vals = Vec::with_capacity(n);
     for i in 0..n {
         let t = i as f64 / (n - 1) as f64;
@@ -1650,6 +1701,320 @@ fn draw_transect_profile(
         FontId::monospace(9.5),
         Color32::LIGHT_GRAY,
     );
+}
+
+fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
+    fn noop_clone(_: *const ()) -> std::task::RawWaker {
+        noop_raw_waker()
+    }
+    fn noop(_: *const ()) {}
+    fn noop_raw_waker() -> std::task::RawWaker {
+        static VTABLE: std::task::RawWakerVTable =
+            std::task::RawWakerVTable::new(noop_clone, noop, noop, noop);
+        std::task::RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    let waker = unsafe { std::task::Waker::from_raw(noop_raw_waker()) };
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(val) => return val,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+fn write_rgba_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+    let row_bytes = width as usize * 4;
+    if rgba.len() != row_bytes * height as usize {
+        anyhow::bail!("Unexpected RGBA buffer length {}", rgba.len());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut raw = Vec::with_capacity((row_bytes + 1) * height as usize);
+    for row in rgba.chunks_exact(row_bytes) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+    let (mut s1, mut s2) = (1u32, 0u32);
+    for &b in &raw {
+        s1 = (s1 + b as u32) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    let mut zlib = Vec::with_capacity(raw.len() + (raw.len() / 65535 + 1) * 5 + 6);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    let n_chunks = raw.len().div_ceil(65535).max(1);
+    for (idx, chunk) in raw.chunks(65535).enumerate() {
+        zlib.push(if idx + 1 == n_chunks { 0x01 } else { 0x00 });
+        let len = chunk.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(chunk);
+    }
+    zlib.extend_from_slice(&((s2 << 16) | s1).to_be_bytes());
+
+    let push_chunk = |out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(data);
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in tag.iter().chain(data.iter()) {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        out.extend_from_slice(&(crc ^ 0xFFFF_FFFF).to_be_bytes());
+    };
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let mut ihdr = [0u8; 13];
+    ihdr[0..4].copy_from_slice(&width.to_be_bytes());
+    ihdr[4..8].copy_from_slice(&height.to_be_bytes());
+    ihdr[8] = 8;
+    ihdr[9] = 6;
+    push_chunk(&mut png, b"IHDR", &ihdr);
+    push_chunk(&mut png, b"IDAT", &zlib);
+    push_chunk(&mut png, b"IEND", &[]);
+    std::fs::write(path, png)?;
+    Ok(())
+}
+
+/// Render an offscreen 1600x1000 RGBA PNG screenshot without opening any OS GUI window.
+pub fn render_headless_screenshot(
+    workers: RunningWorkers,
+    out_path: &std::path::Path,
+    view: u8,
+) -> Result<()> {
+    use eframe::egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
+
+    let width: u32 = 1600;
+    let height: u32 = 1000;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+    let adapter = block_on_future(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .ok_or_else(|| anyhow::anyhow!("No GPU adapter available for offscreen rendering"))?;
+    let (device, queue) = block_on_future(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("terratwin-offscreen-device"),
+            ..Default::default()
+        },
+        None,
+    ))
+    .map_err(|e| anyhow::anyhow!("Failed to request offscreen GPU device: {e}"))?;
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("terratwin-offscreen-target"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bytes_per_row = width * 4;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("terratwin-offscreen-staging"),
+        size: (bytes_per_row * height) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut renderer = Renderer::new(&device, format, None, 1, false);
+    let egui_ctx = egui::Context::default();
+    egui_ctx.set_pixels_per_point(1.0);
+    let mut app = TerraTwinGuiApp::new_headless(workers);
+
+    if view == 2 {
+        app.projection = MapProjectionKind::Equirectangular2d;
+        app.camera.center_lon = 0.0;
+        app.camera.center_lat = 0.0;
+        app.camera.zoom = 1.0;
+        app.basemap_id = "bathymetry_topography_shaded".to_string();
+        app.anomaly_mode = false;
+        app.open_visible_groups_only = true;
+        app.pinned_coord = (74.0, -40.0);
+        app.coord_search_buf = "74.0000, -40.0000".to_string();
+        for st in app.layer_states.values_mut() {
+            st.visible = false;
+        }
+        for (id, op) in [
+            ("sea_ice_concentration_drift", 0.94f32),
+            ("sea_ice_thickness_freeboard_age", 0.78),
+            ("gravimetric_ice_sheet_mass_balance", 0.78),
+            ("permafrost_thermokarst_subsidence", 0.82),
+        ] {
+            if let Some(st) = app.layer_states.get_mut(id) {
+                st.visible = true;
+                st.opacity = op;
+            }
+        }
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if app.workers.coordinator.latest_snapshot().is_some() {
+                break;
+            }
+        }
+        app.raster_dirty = true;
+    } else if view == 3 {
+        app.sim_cfg.scenario = SspScenario::Ssp5_85;
+        app.sim_cfg.sim_year = 2085.0;
+        app.sim_cfg.ocean_depth_m = 450.0;
+        app.anomaly_mode = false;
+        app.open_visible_groups_only = true;
+        app.projection = MapProjectionKind::Globe3dWgs84;
+        app.camera.center_lat = 26.0;
+        app.camera.center_lon = -52.0;
+        app.camera.zoom = 1.0;
+        app.basemap_id = "bathymetry_topography_shaded".to_string();
+        app.pinned_coord = (36.0, -56.0);
+        app.coord_search_buf = "36.0000, -56.0000".to_string();
+        app.transect_mode = true;
+        app.transect_points = vec![(26.0, -76.0), (54.0, -14.0)];
+        for st in app.layer_states.values_mut() {
+            st.visible = false;
+        }
+        for (id, op) in [
+            ("toa_radiative_energy_budget", 0.30f32),
+            ("sst_marine_heatwaves", 0.85),
+            ("coastal_inundation_storm_surge", 0.95),
+            ("cmip6_downscaled_ensemble", 0.45),
+        ] {
+            if let Some(st) = app.layer_states.get_mut(id) {
+                st.visible = true;
+                st.opacity = op;
+            }
+        }
+        app.push_sim_update();
+        for _ in 0..25 {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            if let Some(snap) = app.workers.coordinator.latest_snapshot() {
+                if snap.config.scenario == SspScenario::Ssp5_85
+                    && (snap.config.sim_year - 2085.0).abs() < 0.5
+                    && (snap.config.ocean_depth_m - 450.0).abs() < 1.0
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    let warmup_delays_ms = [350u64, 250, 150, 150];
+    for (frame_idx, delay_ms) in warmup_delays_ms.into_iter().enumerate() {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width as f32, height as f32),
+            )),
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(1.0),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            time: Some(frame_idx as f64 / 60.0),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            app.ui_step(ctx);
+        });
+        for (id, image_delta) in &full_output.textures_delta.set {
+            renderer.update_texture(&device, &queue, *id, image_delta);
+        }
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [width, height],
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("terratwin-offscreen-encoder"),
+        });
+        let user_cmd_bufs = renderer.update_buffers(
+            &device,
+            &queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("terratwin-offscreen-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            let mut render_pass = render_pass.forget_lifetime();
+            renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
+        }
+        if frame_idx == 3 {
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &staging,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(user_cmd_bufs.into_iter().chain(std::iter::once(encoder.finish())));
+        device.poll(wgpu::Maintain::Wait);
+        for id in &full_output.textures_delta.free {
+            renderer.free_texture(id);
+        }
+    }
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv()
+        .map_err(|e| anyhow::anyhow!("GPU readback channel error: {e}"))?
+        .map_err(|e| anyhow::anyhow!("GPU buffer map failed: {e}"))?;
+    let mapped = slice.get_mapped_range();
+    write_rgba_png(out_path, width, height, &mapped)?;
+    drop(mapped);
+    staging.unmap();
+    Ok(())
 }
 
 /// Launch the native hardware-accelerated desktop GUI window.
