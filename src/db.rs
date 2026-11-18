@@ -207,7 +207,9 @@ impl ClimateDatabase {
         let path_buf = path.as_ref().to_path_buf();
         if let Some(parent) = path_buf.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).ok();
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed creating SQLite DB directory {}", parent.display())
+                })?;
             }
         }
         let conn = Connection::open(&path_buf)
@@ -1024,7 +1026,15 @@ impl ClimateDatabase {
             "cells": cells,
         });
 
-        std::fs::write(output_path, serde_json::to_string_pretty(&export_doc)?)?;
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed creating JSON export directory {}", parent.display())
+                })?;
+            }
+        }
+        std::fs::write(output_path, serde_json::to_string_pretty(&export_doc)?)
+            .with_context(|| format!("Failed writing JSON subset to {}", output_path.display()))?;
         Ok(cells.len())
     }
 

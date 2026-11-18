@@ -738,6 +738,14 @@ pub fn interpolate_log_pressure(levels_hpa: &[f64], values: &[f64], target_hpa: 
     values[0]
 }
 
+/// Aspect-preserving NDC scaling factors `(scale_x, scale_y)` for 2:1 Plate Carrée (`EPSG:4326`),
+/// guaranteeing `W_map / H_map = 2.0` within `[-1.0, 1.0]^2` at `zoom = 1.0` for any viewport aspect.
+#[inline]
+pub fn equirectangular_scales(aspect_w_over_h: f64) -> (f64, f64) {
+    let aspect = aspect_w_over_h.max(0.2);
+    ((2.0 / aspect).min(1.0), (aspect / 2.0).min(1.0))
+}
+
 /// Forward map projection from `(lat_deg, lon_deg, elevation_m)` to normalized viewport coordinates
 /// `[-1.0, 1.0] x [-1.0, 1.0]`.
 pub fn project_latlon_to_ndc(
@@ -751,10 +759,11 @@ pub fn project_latlon_to_ndc(
     let aspect = aspect_w_over_h.max(0.2);
     match proj {
         MapProjectionKind::Equirectangular2d => {
+            let (scale_x, scale_y) = equirectangular_scales(aspect);
             let dlon = ((lon_deg - cam.center_lon + 540.0).rem_euclid(360.0)) - 180.0;
             let dlat = lat_deg - cam.center_lat;
-            let x = (dlon / 180.0) * cam.zoom;
-            let y = (dlat / 90.0) * cam.zoom;
+            let x = (dlon / 180.0) * cam.zoom * scale_x;
+            let y = (dlat / 90.0) * cam.zoom * scale_y;
             if x.abs() <= 1.25 && y.abs() <= 1.25 {
                 Some((x as f32, y as f32))
             } else {
@@ -820,12 +829,16 @@ pub fn unproject_ndc_to_latlon(
     let aspect = aspect_w_over_h.max(0.2);
     match proj {
         MapProjectionKind::Equirectangular2d => {
-            let lat = cam.center_lat + (ndc_y / cam.zoom) * 90.0;
+            let (scale_x, scale_y) = equirectangular_scales(aspect);
+            let lat = cam.center_lat + (ndc_y / (cam.zoom * scale_y)) * 90.0;
             if !(-90.0..=90.0).contains(&lat) {
                 return None;
             }
-            let lon =
-                ((cam.center_lon + (ndc_x / cam.zoom) * 180.0 + 540.0).rem_euclid(360.0)) - 180.0;
+            let dlon = (ndc_x / (cam.zoom * scale_x)) * 180.0;
+            if dlon.abs() > 180.0 {
+                return None;
+            }
+            let lon = ((cam.center_lon + dlon + 540.0).rem_euclid(360.0)) - 180.0;
             Some((lat, lon))
         }
         MapProjectionKind::Globe3dWgs84 => {
@@ -884,6 +897,76 @@ pub fn unproject_ndc_to_latlon(
             Some((phi.to_degrees().clamp(-90.0, 90.0), lon))
         }
     }
+}
+
+/// Interpolate along the spherical great-circle arc between `a = (lat1, lon1)` and
+/// `b = (lat2, lon2)` at fraction `t` in `[0.0, 1.0]`, handling coincident (`omega < 1e-5`)
+/// via NLERP and antipodal (`omega > pi - 1e-5`) via an orthonormal great-circle frame.
+pub fn slerp_latlon(a: (f64, f64), b: (f64, f64), t: f64) -> (f64, f64) {
+    let t = t.clamp(0.0, 1.0);
+    let to_vec = |lat: f64, lon: f64| -> [f64; 3] {
+        let phi = lat.to_radians();
+        let lam = lon.to_radians();
+        [phi.cos() * lam.cos(), phi.cos() * lam.sin(), phi.sin()]
+    };
+    let norm3 = |v: [f64; 3]| -> [f64; 3] {
+        let m = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+            .sqrt()
+            .max(1e-15);
+        [v[0] / m, v[1] / m, v[2] / m]
+    };
+
+    let p = to_vec(a.0, a.1);
+    let q = to_vec(b.0, b.1);
+    let dot = (p[0] * q[0] + p[1] * q[1] + p[2] * q[2]).clamp(-1.0, 1.0);
+    let omega = dot.acos();
+
+    let v = if omega < 1e-5 {
+        norm3([
+            p[0] + t * (q[0] - p[0]),
+            p[1] + t * (q[1] - p[1]),
+            p[2] + t * (q[2] - p[2]),
+        ])
+    } else if omega > std::f64::consts::PI - 1e-5 {
+        let ref_ax = if p[2].abs() < 0.9 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+        let cross = [
+            p[1] * ref_ax[2] - p[2] * ref_ax[1],
+            p[2] * ref_ax[0] - p[0] * ref_ax[2],
+            p[0] * ref_ax[1] - p[1] * ref_ax[0],
+        ];
+        let ortho = norm3(cross);
+        let theta = t * omega;
+        norm3([
+            p[0] * theta.cos() + ortho[0] * theta.sin(),
+            p[1] * theta.cos() + ortho[1] * theta.sin(),
+            p[2] * theta.cos() + ortho[2] * theta.sin(),
+        ])
+    } else {
+        let sin_om = omega.sin();
+        let w0 = ((1.0 - t) * omega).sin() / sin_om;
+        let w1 = (t * omega).sin() / sin_om;
+        norm3([
+            w0 * p[0] + w1 * q[0],
+            w0 * p[1] + w1 * q[1],
+            w0 * p[2] + w1 * q[2],
+        ])
+    };
+
+    let lat = v[2].clamp(-1.0, 1.0).asin().to_degrees();
+    let lon = v[1].atan2(v[0]).to_degrees();
+    (lat, lon)
+}
+
+/// Sample `segments + 1` points along the spherical SLERP great-circle arc from `a` to `b`.
+pub fn slerp_great_circle(a: (f64, f64), b: (f64, f64), segments: usize) -> Vec<(f64, f64)> {
+    let segs = segments.max(1);
+    (0..=segs)
+        .map(|i| slerp_latlon(a, b, i as f64 / segs as f64))
+        .collect()
 }
 
 /// Spherical line segment on a `level` isoline extracted by Marching Squares.

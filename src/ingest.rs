@@ -212,7 +212,7 @@ pub struct TelemetryIngestor {
 impl TelemetryIngestor {
     pub fn new(config: IngestionConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .user_agent("TerraTwin-Climate-Hub/2.4.0 (Rust Native Telemetry Assimilator)")
+            .user_agent("TerraTwin-Climate-Hub/2.5.0 (Rust Native Telemetry Assimilator)")
             .timeout(config.request_timeout)
             .build()?;
         Ok(Self { client, config })

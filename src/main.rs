@@ -18,6 +18,8 @@
 //! 2. **Native Headless Background Daemon & CLI Utilities** (`terratwin --headless`, `terratwin daemon`,
 //!    `terratwin step`, `terratwin status`, `terratwin export`)
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -158,7 +160,21 @@ enum Commands {
     },
 }
 
+#[cfg(windows)]
+fn attach_parent_console_if_cli() {
+    if std::env::args_os().len() > 1 {
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_parent_console_if_cli();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

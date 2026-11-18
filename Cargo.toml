@@ -7,7 +7,7 @@ license = "GPL-3.0-or-later"
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:egui"]
+gui = ["dep:eframe", "dep:egui", "dep:rfd"]
 
 [[bin]]
 name = "terratwin"
@@ -32,8 +32,13 @@ zstd = "0.13"
 # Native GUI dependencies (optional so pure headless server builds can pass --no-default-features)
 eframe = { version = "=0.29.1", features = ["wgpu"], optional = true }
 egui = { version = "=0.29.1", optional = true }
+rfd = { version = "0.15", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+strip = "symbols"

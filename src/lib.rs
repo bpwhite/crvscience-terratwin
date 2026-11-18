@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-//! TerraTwin HPC Climate Modeling & Telemetry Hub (`v2.4.0`).
+//! TerraTwin HPC Climate Modeling & Telemetry Hub (`v2.5.0`).
 //! Core library crate exposing schema parsing, SQLite WAL persistence,
 //! async public climate telemetry ingestion, spherical reprojection & Barnes interpolation,
 //! multi-threaded Rayon climate physics simulation, and optional native `eframe`/`egui` GUI.

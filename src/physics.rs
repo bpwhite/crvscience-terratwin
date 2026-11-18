@@ -334,8 +334,8 @@ pub fn spherical_diffusive_heat_step(
     let min_grid_m2 = dy_m.min(dx_min_m).powi(2);
 
     let dt_max = (0.20 * min_grid_m2 / diffusivity_m2_s).max(1.0);
-    let n_sub = ((dt_secs / dt_max).ceil() as usize).clamp(1, 64);
-    let dt_sub = dt_secs / (n_sub as f64);
+    let n_sub = ((dt_secs / dt_max).ceil() as usize).clamp(1, 256);
+    let dt_sub = (dt_secs / (n_sub as f64)).min(dt_max);
 
     let mut cur = field.to_vec();
     let mut next = cur.clone();
@@ -1087,7 +1087,7 @@ pub fn step_two_layer_qgpv(
     if dt_secs > 0.0 && prev_q1_q2.is_some() {
         // Sub-step in <= 3600s increments so Rossby wave phase & baroclinic shear stay sharp
         let n_sub = ((dt_secs / 3600.0).ceil() as usize).clamp(1, 24);
-        let dt_sub = dt_secs / (n_sub as f64);
+        let dt_sub = (dt_secs / (n_sub as f64)).min(3600.0);
         let tau_rad_s = 7.0 * 86_400.0; // 7-day radiative thermal-wind restoring timescale
         let nu_pv_m2_s = 1.5e5_f64; // Scale-selective subgrid enstrophy diffusivity
 
@@ -1512,7 +1512,7 @@ pub fn step_ocean_reduced_gravity_and_gyre(
         let dx_min = (EARTH_RADIUS_M * QG_MIN_COS_ZONAL * dlam).min(EARTH_RADIUS_M * dphi);
         let dt_cfl = (0.42 * dx_min / c1.max(1.0)).max(600.0);
         let n_sub = ((dt_secs / dt_cfl).ceil() as usize).clamp(1, 32);
-        let dt_sub = dt_secs / (n_sub as f64);
+        let dt_sub = (dt_secs / (n_sub as f64)).min(dt_cfl);
 
         let r_drag = 1.2e-6_f64; // Rayleigh momentum damping (s^-1)
         let r_tc_damp = 1.0 / (180.0 * 86_400.0); // 180-day thermocline Newtonian damping
@@ -1720,6 +1720,24 @@ pub fn compute_outdoor_wbgt(t_c: f64, rh_pct: f64, shortwave_wm2: f64, wind_ms: 
 #[inline]
 pub fn co2_radiative_forcing_wm2(co2_ppm: f64) -> f64 {
     5.35 * (co2_ppm.max(180.0) / 278.0).ln()
+}
+
+/// Transient global mean surface warming (°C over 1850–1900 pre-industrial) from CO2 forcing
+/// (`ECS = 3.0 °C` per doubling `3.71 W m^-2`, realized transient climate response fraction `0.72`).
+#[inline]
+pub fn equilibrium_global_warming_c(co2_ppm: f64) -> f64 {
+    (co2_radiative_forcing_wm2(co2_ppm) / 3.71) * 3.0 * 0.72
+}
+
+/// Latitudinal polar amplification factor (asymmetric Arctic vs Antarctic amplification).
+#[inline]
+pub fn polar_amplification_factor(lat_deg: f64) -> f64 {
+    let sin_phi = lat_deg.to_radians().sin();
+    if lat_deg > 0.0 {
+        0.85 + 1.75 * sin_phi * sin_phi
+    } else {
+        0.85 + 0.70 * sin_phi * sin_phi
+    }
 }
 
 /// Full 6-component Van Wagner & Pickett (1985) / Van Wagner (1987) Canadian Forest Fire Weather Index
@@ -2484,11 +2502,19 @@ fn earth_river_corridor_signal(lat: f64, lon: f64) -> f64 {
 }
 
 #[inline]
-fn preindustrial_baseline_t2m_c(lat_deg: f64, elev_m: f64) -> f64 {
+pub fn preindustrial_baseline_t2m_c(lat_deg: f64, elev_m: f64) -> f64 {
     let phi = lat_deg.to_radians();
     27.8 * phi.cos()
         - 15.5 * phi.sin().powi(2)
         - if elev_m > 0.0 { 0.0065 * elev_m } else { 0.0 }
+}
+
+/// Seasonal 2 m air temperature cycle (°C) relative to the annual-mean baseline.
+#[inline]
+pub fn seasonal_surface_swing_c(lat_deg: f64, is_ocean: bool, day_of_year: f64) -> f64 {
+    let phi = lat_deg.to_radians();
+    let seasonal_phase = 2.0 * std::f64::consts::PI * (day_of_year - 172.0) / 365.25;
+    (if is_ocean { 4.5 } else { 14.0 }) * phi.sin() * seasonal_phase.cos()
 }
 
 pub struct ClimateSimulationEngine {
@@ -2533,7 +2559,7 @@ impl ClimateSimulationEngine {
         };
 
         let df_co2 = co2_radiative_forcing_wm2(base_co2_ppm);
-        let global_warming_over_preindustrial = (df_co2 / 3.71) * 3.0 * 0.72;
+        let global_warming_over_preindustrial = equilibrium_global_warming_c(base_co2_ppm);
         let observed_enso = raw_osc
             .iter()
             .find(|s| s.latitude.abs() < 10.0)
@@ -2612,11 +2638,7 @@ impl ClimateSimulationEngine {
             .for_each(|(row, row_slice)| {
                 let lat = 90.0 - (row as f64 + 0.5) * (180.0 / h as f64);
                 let phi = lat.to_radians();
-                let polar_amp = if lat > 0.0 {
-                    0.85 + 1.75 * phi.sin().powi(2)
-                } else {
-                    0.85 + 0.70 * phi.sin().powi(2)
-                };
+                let polar_amp = polar_amplification_factor(lat);
 
                 for (col, cell) in row_slice.iter_mut().enumerate() {
                     let lon = -180.0 + (col as f64 + 0.5) * (360.0 / w as f64);
@@ -2630,8 +2652,7 @@ impl ClimateSimulationEngine {
                     .max(0.0);
                     let shortwave = 1361.0 * 0.74 * cos_zenith;
 
-                    let seasonal_swing =
-                        if is_ocean { 4.5 } else { 14.0 } * phi.sin() * seasonal_phase.cos();
+                    let seasonal_swing = seasonal_surface_swing_c(lat, is_ocean, cfg.day_of_year);
                     let enso_footprint = enso_nino34
                         * (-((lat / 10.0).powi(2)) - (((lon + 125.0) / 48.0).powi(2))).exp();
 
@@ -2950,6 +2971,7 @@ impl ClimateSimulationEngine {
                     .enumerate()
                     .map(|(i, c)| {
                         (preindustrial_baseline_t2m_c(c.lat, c.elev_m)
+                            + seasonal_surface_swing_c(c.lat, c.is_ocean, cfg.day_of_year)
                             + prev_anom_grid.values[i] as f64) as f32
                     })
                     .collect();
@@ -3990,8 +4012,9 @@ impl ClimateSimulationEngine {
                     // === GROUP 6: CLIMATE RISK, ATTRIBUTION & CMIP PROJECTIONS ===
                     "cmip6_downscaled_ensemble" => {
                         for (i, c) in core_cells.iter().enumerate() {
-                            let preind = preindustrial_baseline_t2m_c(c.lat, c.elev_m);
-                            values[i] = (c.t2m_c - preind) as f32;
+                            let seasonal_preind = preindustrial_baseline_t2m_c(c.lat, c.elev_m)
+                                + seasonal_surface_swing_c(c.lat, c.is_ocean, cfg.day_of_year);
+                            values[i] = (c.t2m_c - seasonal_preind) as f32;
                         }
                     }
                     "wet_bulb_globe_temp_heat_stress" => {
@@ -4120,8 +4143,9 @@ impl ClimateSimulationEngine {
 
         for c in &core_cells {
             let cos_phi = c.lat.to_radians().cos().max(0.01);
-            let preind_t = preindustrial_baseline_t2m_c(c.lat, c.elev_m);
-            area_w_temp += (c.t2m_c - preind_t) * cos_phi;
+            let seasonal_preind_t = preindustrial_baseline_t2m_c(c.lat, c.elev_m)
+                + seasonal_surface_swing_c(c.lat, c.is_ocean, cfg.day_of_year);
+            area_w_temp += (c.t2m_c - seasonal_preind_t) * cos_phi;
             area_sum += cos_phi;
 
             if c.is_ocean && c.lat.abs() <= 60.0 {
@@ -4161,35 +4185,15 @@ impl ClimateSimulationEngine {
         lat: f64,
         lon: f64,
     ) -> Vec<(f64, f64, f64, f64)> {
-        let levels = &self
-            .schema
-            .main_viewport
-            .vertical_slice_engine
-            .atmospheric_levels_hpa;
-
-        let t_surf = self
-            .db
-            .load_latest_grid("wet_bulb_globe_temp_heat_stress", cfg.scenario, 1000.0)
-            .ok()
-            .flatten()
-            .map(|g| sample_grid_bilinear(&g.values, g.width, g.height, lat, lon) as f64)
-            .unwrap_or(18.0);
-
-        levels
-            .iter()
-            .map(|&p_u32| {
-                let p = p_u32 as f64;
-                let z_km = 7.4 * (1000.0 / p).ln();
-                let temp_c = if z_km <= 11.5 {
-                    t_surf - 6.5 * z_km
-                } else {
-                    (t_surf - 74.75) + 1.8 * (z_km - 11.5)
-                };
-                let dewpoint_c = temp_c - (4.5 + 1.4 * z_km).min(38.0);
-                let wind_ms = 6.0 + 28.0 * (-((p - 250.0) / 180.0).powi(2)).exp();
-                (p, temp_c, dewpoint_c, wind_ms)
-            })
-            .collect()
+        let mut map = HashMap::new();
+        if let Ok(Some(g)) = self.db.load_latest_grid(
+            "wet_bulb_globe_temp_heat_stress",
+            cfg.scenario,
+            1000.0,
+        ) {
+            map.insert("wet_bulb_globe_temp_heat_stress".to_string(), g);
+        }
+        compute_vertical_sounding_from_grids(&self.schema, Some(&map), lat, lon)
     }
 
     /// Compute a 10-level ocean CTD temperature & salinity water-column profile (`0..=6000 m`) at `(lat, lon)`.
@@ -4199,32 +4203,14 @@ impl ClimateSimulationEngine {
         lat: f64,
         lon: f64,
     ) -> Vec<(f64, f64, f64)> {
-        let depths = &self
-            .schema
-            .main_viewport
-            .vertical_slice_engine
-            .ocean_depth_levels_meters;
-
-        let sst = self
+        let mut map = HashMap::new();
+        if let Ok(Some(g)) = self
             .db
             .load_latest_grid("sst_marine_heatwaves", cfg.scenario, 0.0)
-            .ok()
-            .flatten()
-            .map(|g| sample_grid_bilinear(&g.values, g.width, g.height, lat, lon) as f64)
-            .filter(|v| v.is_finite())
-            .unwrap_or_else(|| (26.0 * lat.to_radians().cos()).max(-1.8));
-
-        depths
-            .iter()
-            .map(|&d_u32| {
-                let z = d_u32 as f64;
-                let decay = (-z / 750.0).exp();
-                let temp_c = 1.4 + (sst - 1.4) * decay;
-                let sal_psu = 34.72 + 0.95 * (2.0 * lat.to_radians()).cos() * (-z / 1200.0).exp()
-                    + 0.05 * lon.to_radians().sin();
-                (z, temp_c, sal_psu)
-            })
-            .collect()
+        {
+            map.insert("sst_marine_heatwaves".to_string(), g);
+        }
+        compute_ocean_ctd_profile_from_grids(&self.schema, Some(&map), lat, lon)
     }
 
     /// Load a map of all currently cached latest layer grids for fast multi-layer GUI blending.
@@ -4246,5 +4232,320 @@ impl ClimateSimulationEngine {
             }
         }
         Ok(map)
+    }
+}
+
+/// Latitude band selector for CMIP6 regional ΔT diagnostics & trajectories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClimateRegion {
+    Global,
+    Arctic,
+    MidLatitudes,
+    Tropics,
+    Antarctic,
+    PinnedCell,
+}
+
+impl ClimateRegion {
+    pub const ALL: [ClimateRegion; 6] = [
+        ClimateRegion::Global,
+        ClimateRegion::Arctic,
+        ClimateRegion::MidLatitudes,
+        ClimateRegion::Tropics,
+        ClimateRegion::Antarctic,
+        ClimateRegion::PinnedCell,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ClimateRegion::Global => "Global Mean",
+            ClimateRegion::Arctic => "Arctic (>66.5°N)",
+            ClimateRegion::MidLatitudes => "Mid-Latitudes (23.5–66.5°)",
+            ClimateRegion::Tropics => "Tropics (±23.5°)",
+            ClimateRegion::Antarctic => "Antarctic (<66.5°S)",
+            ClimateRegion::PinnedCell => "Pinned Cell",
+        }
+    }
+}
+
+/// Compute regional ΔT (°C relative to pre-industrial) for a given SSP scenario and year,
+/// integrating `polar_amplification_factor` with `cos(lat)` band weights.
+pub fn regional_cmip6_delta_t_c(
+    ssp: SspScenario,
+    year: f64,
+    region: ClimateRegion,
+    pinned_lat: f64,
+) -> f64 {
+    let global_dt = equilibrium_global_warming_c(ssp.co2_ppm_at_year(year));
+    let amp = match region {
+        ClimateRegion::PinnedCell => polar_amplification_factor(pinned_lat),
+        _ => {
+            let mut num = 0.0;
+            let mut den = 0.0;
+            for idx in -180..=180 {
+                let lat = (idx as f64) * 0.5;
+                let in_band = match region {
+                    ClimateRegion::Global => true,
+                    ClimateRegion::Arctic => lat >= 66.5,
+                    ClimateRegion::MidLatitudes => lat.abs() >= 23.5 && lat.abs() < 66.5,
+                    ClimateRegion::Tropics => lat.abs() < 23.5,
+                    ClimateRegion::Antarctic => lat <= -66.5,
+                    ClimateRegion::PinnedCell => false,
+                };
+                if in_band {
+                    let w = lat.to_radians().cos().max(0.005);
+                    num += polar_amplification_factor(lat) * w;
+                    den += w;
+                }
+            }
+            if den > 0.0 {
+                num / den
+            } else {
+                1.0
+            }
+        }
+    };
+    global_dt * amp
+}
+
+/// Compute live area-weighted regional ΔT (°C) from an in-memory `cmip6_downscaled_ensemble` grid.
+pub fn snapshot_regional_delta_t_c(
+    grid: &StoredGridRecord,
+    region: ClimateRegion,
+    pinned_lat: f64,
+    pinned_lon: f64,
+) -> Option<f64> {
+    if region == ClimateRegion::PinnedCell {
+        let v = sample_grid_bilinear(&grid.values, grid.width, grid.height, pinned_lat, pinned_lon)
+            as f64;
+        return if v.is_finite() { Some(v) } else { None };
+    }
+    let mut sum = 0.0;
+    let mut w_sum = 0.0;
+    for row in 0..grid.height {
+        let lat = 90.0 - (row as f64 + 0.5) * (180.0 / grid.height as f64);
+        let in_band = match region {
+            ClimateRegion::Global => true,
+            ClimateRegion::Arctic => lat >= 66.5,
+            ClimateRegion::MidLatitudes => lat.abs() >= 23.5 && lat.abs() < 66.5,
+            ClimateRegion::Tropics => lat.abs() < 23.5,
+            ClimateRegion::Antarctic => lat <= -66.5,
+            ClimateRegion::PinnedCell => false,
+        };
+        if !in_band {
+            continue;
+        }
+        let w = lat.to_radians().cos().max(0.01);
+        for col in 0..grid.width {
+            let v = grid.values[row * grid.width + col] as f64;
+            if v.is_finite() {
+                sum += v * w;
+                w_sum += w;
+            }
+        }
+    }
+    if w_sum > 0.0 {
+        Some(sum / w_sum)
+    } else {
+        None
+    }
+}
+
+/// In-memory 10-level atmospheric Skew-T / vertical sounding profile (`1000..=10 hPa`) at `(lat, lon)`
+/// reading strictly from `grids` (zero SQLite I/O).
+pub fn compute_vertical_sounding_from_grids(
+    schema: &HubSchema,
+    grids: Option<&HashMap<String, StoredGridRecord>>,
+    lat: f64,
+    lon: f64,
+) -> Vec<(f64, f64, f64, f64)> {
+    let levels = &schema
+        .main_viewport
+        .vertical_slice_engine
+        .atmospheric_levels_hpa;
+
+    let t_surf = grids
+        .and_then(|map| map.get("wet_bulb_globe_temp_heat_stress"))
+        .map(|g| sample_grid_bilinear(&g.values, g.width, g.height, lat, lon) as f64)
+        .filter(|v| v.is_finite())
+        .unwrap_or(18.0);
+
+    levels
+        .iter()
+        .map(|&p_u32| {
+            let p = p_u32 as f64;
+            let z_km = 7.4 * (1000.0 / p).ln();
+            let temp_c = if z_km <= 11.5 {
+                t_surf - 6.5 * z_km
+            } else {
+                (t_surf - 74.75) + 1.8 * (z_km - 11.5)
+            };
+            let dewpoint_c = temp_c - (4.5 + 1.4 * z_km).min(38.0);
+            let wind_ms = 6.0 + 28.0 * (-((p - 250.0) / 180.0).powi(2)).exp();
+            (p, temp_c, dewpoint_c, wind_ms)
+        })
+        .collect()
+}
+
+/// In-memory 10-level ocean CTD temperature & salinity profile (`0..=6000 m`) at `(lat, lon)`
+/// reading strictly from `grids` (zero SQLite I/O).
+pub fn compute_ocean_ctd_profile_from_grids(
+    schema: &HubSchema,
+    grids: Option<&HashMap<String, StoredGridRecord>>,
+    lat: f64,
+    lon: f64,
+) -> Vec<(f64, f64, f64)> {
+    let depths = &schema
+        .main_viewport
+        .vertical_slice_engine
+        .ocean_depth_levels_meters;
+
+    let sst = grids
+        .and_then(|map| map.get("sst_marine_heatwaves"))
+        .map(|g| sample_grid_bilinear(&g.values, g.width, g.height, lat, lon) as f64)
+        .filter(|v| v.is_finite())
+        .unwrap_or_else(|| (26.0 * lat.to_radians().cos()).max(-1.8));
+
+    depths
+        .iter()
+        .map(|&d_u32| {
+            let z = d_u32 as f64;
+            let decay = (-z / 750.0).exp();
+            let temp_c = 1.4 + (sst - 1.4) * decay;
+            let sal_psu = 34.72 + 0.95 * (2.0 * lat.to_radians()).cos() * (-z / 1200.0).exp()
+                + 0.05 * lon.to_radians().sin();
+            (z, temp_c, sal_psu)
+        })
+        .collect()
+}
+
+/// Subsurface 0–20 m land cryosphere, permafrost, and soil moisture profile computed in-memory
+/// from cached simulation grids (`cmip6_downscaled_ensemble`, `permafrost_thermokarst_subsidence`,
+/// `gravimetric_ice_sheet_mass_balance`, `alpine_glacier_velocity_rgi`, `soil_moisture_groundwater_grace`).
+#[derive(Debug, Clone)]
+pub struct LandCryosphereProfile {
+    pub elev_m: f64,
+    pub surface_t2m_c: f64,
+    pub active_layer_m: Option<f64>,
+    pub ice_sheet_smb_cm: Option<f64>,
+    pub glacier_vel_m_yr: Option<f64>,
+    pub soil_moisture: Option<f64>,
+    /// `(depth_m, ground_temp_c, liquid_moisture_frac)` across `0.0..=20.0 m`.
+    pub levels: Vec<(f64, f64, f64)>,
+}
+
+pub fn compute_land_cryosphere_profile_from_grids(
+    grids: Option<&HashMap<String, StoredGridRecord>>,
+    lat: f64,
+    lon: f64,
+    elev_m: f64,
+    scenario: SspScenario,
+    sim_year: f64,
+) -> LandCryosphereProfile {
+    compute_land_cryosphere_profile_impl(grids, lat, lon, elev_m, scenario, sim_year, None)
+}
+
+/// In-memory 0–20 m land cryosphere/permafrost profile evaluated at a specific `day_of_year`,
+/// adding `seasonal_surface_swing_c` to reconstruct seasonal surface `T2m` damping toward the
+/// deseasonalized annual-mean ground/firn temperature at depth.
+pub fn compute_land_cryosphere_profile_from_grids_at_doy(
+    grids: Option<&HashMap<String, StoredGridRecord>>,
+    lat: f64,
+    lon: f64,
+    elev_m: f64,
+    scenario: SspScenario,
+    sim_year: f64,
+    day_of_year: f64,
+) -> LandCryosphereProfile {
+    compute_land_cryosphere_profile_impl(
+        grids,
+        lat,
+        lon,
+        elev_m,
+        scenario,
+        sim_year,
+        Some(day_of_year),
+    )
+}
+
+fn compute_land_cryosphere_profile_impl(
+    grids: Option<&HashMap<String, StoredGridRecord>>,
+    lat: f64,
+    lon: f64,
+    elev_m: f64,
+    scenario: SspScenario,
+    sim_year: f64,
+    day_of_year: Option<f64>,
+) -> LandCryosphereProfile {
+    let sample_opt = |layer_id: &str| -> Option<f64> {
+        grids
+            .and_then(|map| map.get(layer_id))
+            .map(|g| sample_grid_bilinear(&g.values, g.width, g.height, lat, lon) as f64)
+            .filter(|v| v.is_finite())
+    };
+
+    let base_t2m = preindustrial_baseline_t2m_c(lat, elev_m);
+    let dt_anom = sample_opt("cmip6_downscaled_ensemble").unwrap_or_else(|| {
+        equilibrium_global_warming_c(scenario.co2_ppm_at_year(sim_year))
+            * polar_amplification_factor(lat)
+    });
+    let t_mean_annual = base_t2m + dt_anom;
+    let seasonal_swing = day_of_year
+        .map(|doy| seasonal_surface_swing_c(lat, false, doy))
+        .unwrap_or(0.0);
+    let surface_t2m_c = t_mean_annual + seasonal_swing;
+
+    let active_layer_m = sample_opt("permafrost_thermokarst_subsidence");
+    let ice_sheet_smb_cm = sample_opt("gravimetric_ice_sheet_mass_balance");
+    let glacier_vel_m_yr = sample_opt("alpine_glacier_velocity_rgi");
+    let soil_moisture = sample_opt("soil_moisture_groundwater_grace");
+
+    let depths = [0.0, 0.5, 1.0, 2.0, 3.5, 5.0, 7.5, 10.0, 15.0, 20.0];
+    let total_w = soil_moisture.unwrap_or(0.24).clamp(0.02, 0.55);
+
+    let levels = depths
+        .iter()
+        .map(|&z| {
+            let t_z = if let Some(thaw_m) = active_layer_m {
+                if thaw_m > 0.05 {
+                    let t_surf = surface_t2m_c.max(0.5);
+                    let t_deep = (-4.2 - 0.14 * (lat.abs() - 52.0).max(0.0)).min(-0.8);
+                    if z <= thaw_m {
+                        t_surf * (1.0 - z / thaw_m)
+                    } else {
+                        t_deep * (1.0 - (-((z - thaw_m) / 3.2)).exp()) + 0.025 * (z - thaw_m)
+                    }
+                } else {
+                    t_mean_annual + (surface_t2m_c - t_mean_annual) * (-z / 3.2).exp() + 0.025 * z
+                }
+            } else if ice_sheet_smb_cm.is_some() || t_mean_annual < -2.0 {
+                // Polar ice sheet / firn column with seasonal skin damping toward annual-mean firn temp + geothermal gradient (+0.025 °C/m)
+                t_mean_annual + (surface_t2m_c - t_mean_annual) * (-z / 3.2).exp() + 0.025 * z
+            } else {
+                // Non-cryospheric land: thermal skin damping toward mean annual ground temp + geothermal gradient
+                let t_deep_eq = t_mean_annual - 0.6;
+                t_deep_eq + (surface_t2m_c - t_deep_eq) * (-z / 3.2).exp() + 0.025 * z
+            };
+
+            let liquid_frac = if ice_sheet_smb_cm.is_some() {
+                (0.04 * ((t_z + 1.5) / 2.0).clamp(0.0, 1.0)).clamp(0.0, 0.06)
+            } else {
+                // Smooth Clausius-Clapeyron unfrozen water curve around 0 °C
+                let unfrozen_ratio = 1.0 / (1.0 + (-t_z * 2.5).exp());
+                total_w * unfrozen_ratio
+            };
+
+            (z, t_z, liquid_frac)
+        })
+        .collect();
+
+    LandCryosphereProfile {
+        elev_m,
+        surface_t2m_c,
+        active_layer_m,
+        ice_sheet_smb_cm,
+        glacier_vel_m_yr,
+        soil_moisture,
+        levels,
     }
 }

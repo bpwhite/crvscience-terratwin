@@ -33,22 +33,34 @@ use crate::colormaps::{
     default_layer_style, shade_basemap_with_slope_rgb, ColormapPalette,
 };
 use crate::interp::{
-    detect_mslp_extrema, detect_thermal_fronts, extract_marching_squares_contours,
-    fibonacci_sphere_points, haversine_km, project_latlon_to_ndc, sample_grid_bilinear,
-    unproject_ndc_to_latlon, CameraState, ContourSegment, FrontSegment, MapProjectionKind,
-    PressureExtrema,
+    detect_mslp_extrema, detect_thermal_fronts, equirectangular_scales,
+    extract_marching_squares_contours, fibonacci_sphere_points, haversine_km,
+    project_latlon_to_ndc, sample_grid_bilinear, slerp_great_circle, unproject_ndc_to_latlon,
+    CameraState, ContourSegment, FrontSegment, MapProjectionKind, PressureExtrema,
 };
 use crate::physics::{
-    elevation_slope_m_per_deg, synthetic_planetary_elevation_m, ClimateSimulationEngine,
-    SimulationConfig,
+    compute_land_cryosphere_profile_from_grids_at_doy, compute_ocean_ctd_profile_from_grids,
+    compute_vertical_sounding_from_grids, elevation_slope_m_per_deg, regional_cmip6_delta_t_c,
+    snapshot_regional_delta_t_c, synthetic_planetary_elevation_m, ClimateRegion,
+    LandCryosphereProfile, SimulationConfig,
 };
-use crate::schema::SspScenario;
+use crate::schema::{HubSchema, SspScenario};
 use crate::worker::{RunningWorkers, TelemetrySnapshot};
 use anyhow::Result;
+use chrono::{Datelike, Timelike};
 use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmip6PlotMetric {
+    Co2Ppm,
+    DeltaTC,
+}
 
 #[derive(Debug, Clone)]
 struct LayerUiState {
@@ -69,7 +81,6 @@ struct LagrangianParticle {
 
 pub struct TerraTwinGuiApp {
     workers: RunningWorkers,
-    sim_engine_local: ClimateSimulationEngine,
     sim_cfg: SimulationConfig,
     projection: MapProjectionKind,
     camera: CameraState,
@@ -78,6 +89,7 @@ pub struct TerraTwinGuiApp {
 
     left_sidebar_open: bool,
     right_drawer_open: bool,
+    about_open: bool,
     crosshair_inspector: bool,
     transect_mode: bool,
     transect_points: Vec<(f64, f64)>,
@@ -91,6 +103,9 @@ pub struct TerraTwinGuiApp {
     playback_last_advance: std::time::Instant,
     last_timeline_refresh: std::time::Instant,
     export_status_msg: String,
+
+    cmip6_metric: Cmip6PlotMetric,
+    cmip6_region: ClimateRegion,
 
     layer_states: HashMap<String, LayerUiState>,
     solo_restore_vis: Option<HashMap<String, bool>>,
@@ -112,8 +127,6 @@ impl TerraTwinGuiApp {
 
     pub fn new_headless(workers: RunningWorkers) -> Self {
         let schema = workers.coordinator.schema().clone();
-        let db = workers.coordinator.db().clone();
-        let sim_engine_local = ClimateSimulationEngine::new(schema.clone(), db);
 
         let cam_def = &schema.main_viewport.camera_defaults;
         let camera = CameraState {
@@ -162,7 +175,6 @@ impl TerraTwinGuiApp {
 
         Self {
             workers,
-            sim_engine_local,
             sim_cfg: SimulationConfig::default(),
             projection: MapProjectionKind::from_id(&schema.main_viewport.default_projection),
             camera,
@@ -170,6 +182,7 @@ impl TerraTwinGuiApp {
             anomaly_mode: false,
             left_sidebar_open: true,
             right_drawer_open: true,
+            about_open: false,
             crosshair_inspector: true,
             transect_mode: false,
             transect_points: Vec::new(),
@@ -182,6 +195,8 @@ impl TerraTwinGuiApp {
             playback_last_advance: std::time::Instant::now(),
             last_timeline_refresh: std::time::Instant::now() - std::time::Duration::from_secs(10),
             export_status_msg: String::new(),
+            cmip6_metric: Cmip6PlotMetric::Co2Ppm,
+            cmip6_region: ClimateRegion::Global,
             layer_states,
             solo_restore_vis: None,
             particles,
@@ -562,7 +577,8 @@ impl TerraTwinGuiApp {
                     }
                     ui.colored_label(
                         Color32::from_rgb(98, 210, 255),
-                        egui::RichText::new("TerraTwin HPC v2.4").strong(),
+                        egui::RichText::new(concat!("TerraTwin HPC v", env!("CARGO_PKG_VERSION")))
+                            .strong(),
                     );
                     ui.separator();
 
@@ -599,7 +615,7 @@ impl TerraTwinGuiApp {
                     // Projection Switcher
                     let mut proj_changed = false;
                     egui::ComboBox::from_label("Projection")
-                        .selected_text(self.projection.id())
+                        .selected_text(self.projection.label())
                         .show_ui(ui, |ui| {
                             for p in MapProjectionKind::ALL {
                                 if ui
@@ -676,8 +692,43 @@ impl TerraTwinGuiApp {
                     {
                         self.right_drawer_open = !self.right_drawer_open;
                     }
+                    if ui
+                        .selectable_label(self.about_open, "About")
+                        .clicked()
+                    {
+                        self.about_open = !self.about_open;
+                    }
                 });
             });
+    }
+
+    fn render_about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = self.about_open;
+        egui::Window::new("About TerraTwin")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading("TerraTwin HPC Climate Modeling & Telemetry Hub");
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(4.0);
+                ui.strong("Copyright CRV Science Network");
+                ui.label("License: GNU General Public License v3.0 or later (GPL-3.0-or-later)");
+                ui.add_space(6.0);
+                ui.label(
+                    "Multi-threaded Rayon coupled climate physics engine, 34 predictive global layers, \
+                     SQLite WAL 4D replay, and Zarr v3 scientific subset exporter.",
+                );
+                ui.add_space(6.0);
+                ui.hyperlink_to("CRV Science Network (https://crvscience.com)", "https://crvscience.com");
+                ui.hyperlink_to("CRV Science Public Apps (https://crvscience.com/apps)", "https://crvscience.com/apps");
+            });
+        self.about_open = open;
     }
 
     fn render_left_sidebar(&mut self, ctx: &egui::Context) {
@@ -699,8 +750,13 @@ impl TerraTwinGuiApp {
 
                 // Basemap Selector
                 let basemaps = self.workers.coordinator.schema().main_viewport.base_maps.clone();
+                let basemap_label = basemaps
+                    .iter()
+                    .find(|b| b.id == self.basemap_id)
+                    .map(|b| b.name.as_str())
+                    .unwrap_or(&self.basemap_id);
                 egui::ComboBox::from_label("Basemap")
-                    .selected_text(&self.basemap_id)
+                    .selected_text(basemap_label)
                     .show_ui(ui, |ui| {
                         for bm in &basemaps {
                             if ui
@@ -801,7 +857,7 @@ impl TerraTwinGuiApp {
                                                 self.raster_dirty = true;
                                             }
                                         });
-                                        egui::ComboBox::from_label(format!("Pal ({})", lyr.id))
+                                        egui::ComboBox::new(format!("pal_{}", lyr.id), "Palette")
                                             .selected_text(st.palette.label())
                                             .show_ui(ui, |ui| {
                                                 for pal in ColormapPalette::ALL {
@@ -909,75 +965,272 @@ impl TerraTwinGuiApp {
                     }
 
                     ui.separator();
+                    let schema_ref = self.workers.coordinator.schema();
+                    let grids_opt = self.cached_snapshot.as_ref().map(|s| &s.grids);
+                    let elev_m = synthetic_planetary_elevation_m(plat, plon);
+
                     // 2. Skew-T / Log-P Vertical Atmospheric Profile (1000 -> 10 hPa)
                     ui.strong("Atmospheric Vertical Sounding (1000–10 hPa)");
-                    let sounding = self
-                        .sim_engine_local
-                        .compute_vertical_sounding(&self.sim_cfg, plat, plon);
+                    let sounding =
+                        compute_vertical_sounding_from_grids(schema_ref, grids_opt, plat, plon);
                     draw_sounding_canvas(ui, &sounding);
 
                     ui.separator();
-                    // 3. Ocean Water Column CTD Profile (0 -> 6000 m)
-                    ui.strong("Ocean Water-Column CTD Profile (0–6000 m)");
-                    let ctd = self
-                        .sim_engine_local
-                        .compute_ocean_ctd_profile(&self.sim_cfg, plat, plon);
-                    draw_ctd_canvas(ui, &ctd);
+                    // 3. Ocean Water Column CTD (elev < 0) OR Land Cryosphere & Permafrost (elev >= 0)
+                    if elev_m < 0.0 {
+                        ui.strong("Ocean Water-Column CTD Profile (0–6000 m)");
+                        let ctd =
+                            compute_ocean_ctd_profile_from_grids(schema_ref, grids_opt, plat, plon);
+                        draw_ctd_canvas(ui, &ctd);
+                    } else {
+                        ui.strong("Land Cryosphere & Permafrost Profile (0–20 m)");
+                        let snap_doy = self
+                            .cached_snapshot
+                            .as_ref()
+                            .map(|s| s.config.day_of_year)
+                            .unwrap_or(self.sim_cfg.day_of_year);
+                        let cryo = compute_land_cryosphere_profile_from_grids_at_doy(
+                            grids_opt,
+                            plat,
+                            plon,
+                            elev_m,
+                            self.sim_cfg.scenario,
+                            self.sim_cfg.sim_year,
+                            snap_doy,
+                        );
+                        let mut summary_parts = vec![format!("T2m {:.1} °C", cryo.surface_t2m_c)];
+                        if let Some(thaw) = cryo.active_layer_m {
+                            summary_parts.push(format!("Thaw {:.2} m", thaw));
+                        }
+                        if let Some(smb) = cryo.ice_sheet_smb_cm {
+                            summary_parts.push(format!("SMB {:+.1} cm", smb));
+                        }
+                        if let Some(vel) = cryo.glacier_vel_m_yr {
+                            summary_parts.push(format!("Ice Vel {:.0} m/yr", vel));
+                        }
+                        if let Some(sm) = cryo.soil_moisture {
+                            summary_parts.push(format!("Soil {:.2} m³/m³", sm));
+                        }
+                        ui.small(summary_parts.join(" | "));
+                        draw_land_cryosphere_canvas(ui, &cryo);
+                    }
 
                     ui.separator();
                     // 4. Regional CO2 & Warming Projection + CMIP6 Ensemble Spread Boxplot
                     ui.strong("CMIP6 1950–2100 Trajectory & Ensemble Spread");
-                    draw_cmip6_projection_canvas(ui, self.sim_cfg.scenario, self.sim_cfg.sim_year);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.cmip6_metric,
+                            Cmip6PlotMetric::Co2Ppm,
+                            "CO₂ (ppm)",
+                        );
+                        ui.selectable_value(
+                            &mut self.cmip6_metric,
+                            Cmip6PlotMetric::DeltaTC,
+                            "Regional ΔT (°C)",
+                        );
+                        if self.cmip6_metric == Cmip6PlotMetric::DeltaTC {
+                            egui::ComboBox::new("cmip6_region_combo", "")
+                                .selected_text(self.cmip6_region.label())
+                                .width(132.0)
+                                .show_ui(ui, |ui| {
+                                    for reg in ClimateRegion::ALL {
+                                        ui.selectable_value(
+                                            &mut self.cmip6_region,
+                                            reg,
+                                            reg.label(),
+                                        );
+                                    }
+                                });
+                        }
+                    });
+                    let live_snapshot_val = self.cached_snapshot.as_ref().and_then(|snap| {
+                        match self.cmip6_metric {
+                            Cmip6PlotMetric::Co2Ppm => Some(snap.readouts.mauna_loa_co2_ppm),
+                            Cmip6PlotMetric::DeltaTC => snap
+                                .grids
+                                .get("cmip6_downscaled_ensemble")
+                                .and_then(|g| {
+                                    snapshot_regional_delta_t_c(g, self.cmip6_region, plat, plon)
+                                }),
+                        }
+                    });
+                    draw_cmip6_projection_canvas(
+                        ui,
+                        self.sim_cfg.scenario,
+                        self.sim_cfg.sim_year,
+                        self.cmip6_metric,
+                        self.cmip6_region,
+                        plat,
+                        live_snapshot_val,
+                    );
 
                     if self.transect_points.len() == 2 {
                         ui.separator();
-                        let (a_lat, a_lon) = self.transect_points[0];
-                        let (b_lat, b_lon) = self.transect_points[1];
-                        let dist_km = haversine_km(a_lat, a_lon, b_lat, b_lon);
+                        let (a_la, a_lon) = self.transect_points[0];
+                        let (b_la, b_lon) = self.transect_points[1];
+                        let dist_km = haversine_km(a_la, a_lon, b_la, b_lon);
                         ui.strong(format!("Cross-Section Transect A-B ({:.0} km)", dist_km));
-                        draw_transect_profile(ui, &self.cached_snapshot, &self.layer_states, (a_lat, a_lon), (b_lat, b_lon));
+                        draw_transect_profile(
+                            ui,
+                            schema_ref,
+                            &self.cached_snapshot,
+                            &self.layer_states,
+                            (a_la, a_lon),
+                            (b_la, b_lon),
+                        );
                     }
 
                     ui.separator();
                     ui.strong("Zarr v3 / JSON Subset Exporter");
-                    if ui.button("Export Visible Top Layer Subset").clicked() {
-                        let first_vis = self
-                            .workers
-                            .coordinator
-                            .schema()
-                            .all_layers()
-                            .into_iter()
-                            .find(|(_, l)| {
-                                self.layer_states
-                                    .get(&l.id)
-                                    .map(|s| s.visible)
-                                    .unwrap_or(false)
-                            })
-                            .map(|(_, l)| l.id.clone())
-                            .unwrap_or_else(|| "cmip6_downscaled_ensemble".to_string());
-                        let out_dir = PathBuf::from(format!("subset_{}.zarr", first_vis));
-                        match self.workers.coordinator.db().export_zarr_v3_store(
-                            &first_vis,
-                            self.sim_cfg.scenario,
-                            self.sim_cfg.atmospheric_level_hpa,
-                            (plat - 20.0).max(-90.0),
-                            (plat + 20.0).min(90.0),
-                            (plon - 25.0).max(-180.0),
-                            (plon + 25.0).min(180.0),
-                            (18, 36),
-                            &out_dir,
-                        ) {
-                            Ok(sum) => {
-                                self.export_status_msg = format!(
-                                    "Zarr v3 ({} chunks, {} cells) -> {}",
-                                    sum.chunks_written, sum.cells_exported, sum.store_dir
-                                );
-                            }
-                            Err(e) => {
-                                self.export_status_msg = format!("Zarr v3 export failed: {}", e);
+                    let first_vis_pair = schema_ref
+                        .all_layers()
+                        .into_iter()
+                        .find(|(_, l)| {
+                            self.layer_states
+                                .get(&l.id)
+                                .map(|s| s.visible)
+                                .unwrap_or(false)
+                        })
+                        .map(|(g, l)| {
+                            let lvl = if g.group_id == "physical_biogeochemical_oceanography" {
+                                self.sim_cfg.ocean_depth_m
+                            } else {
+                                self.sim_cfg.atmospheric_level_hpa
+                            };
+                            (l.id.clone(), lvl)
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                "cmip6_downscaled_ensemble".to_string(),
+                                self.sim_cfg.atmospheric_level_hpa,
+                            )
+                        });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Export Zarr v3 Store...").clicked() {
+                            if let Some(out_dir) = rfd::FileDialog::new()
+                                .set_title("Export Zarr v3 Climate Subset Store")
+                                .set_file_name(format!("subset_{}.zarr", first_vis_pair.0))
+                                .save_file()
+                            {
+                                match self.workers.coordinator.db().export_zarr_v3_store(
+                                    &first_vis_pair.0,
+                                    self.sim_cfg.scenario,
+                                    first_vis_pair.1,
+                                    (plat - 20.0).max(-90.0),
+                                    (plat + 20.0).min(90.0),
+                                    (plon - 25.0).max(-180.0),
+                                    (plon + 25.0).min(180.0),
+                                    (18, 36),
+                                    &out_dir,
+                                ) {
+                                    Ok(sum) => {
+                                        self.export_status_msg = format!(
+                                            "Zarr v3 ({} chunks, {} cells) -> {}",
+                                            sum.chunks_written, sum.cells_exported, sum.store_dir
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.export_status_msg =
+                                            format!("Zarr v3 export failed: {}", e);
+                                    }
+                                }
                             }
                         }
-                    }
+
+                        if ui.button("Export JSON Subset...").clicked() {
+                            if let Some(out_file) = rfd::FileDialog::new()
+                                .set_title("Export JSON Climate Subset")
+                                .add_filter("JSON Subset", &["json"])
+                                .set_file_name(format!("subset_{}.json", first_vis_pair.0))
+                                .save_file()
+                            {
+                                match self.workers.coordinator.db().export_layer_subset_json(
+                                    &first_vis_pair.0,
+                                    self.sim_cfg.scenario,
+                                    first_vis_pair.1,
+                                    (plat - 20.0).max(-90.0),
+                                    (plat + 20.0).min(90.0),
+                                    (plon - 25.0).max(-180.0),
+                                    (plon + 25.0).min(180.0),
+                                    &out_file,
+                                ) {
+                                    Ok(cells) => {
+                                        self.export_status_msg = format!(
+                                            "JSON subset ({} cells) -> {}",
+                                            cells,
+                                            out_file.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.export_status_msg =
+                                            format!("JSON export failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+
+                        if ui.button("Open JSON / Schema...").clicked() {
+                            if let Some(in_file) = rfd::FileDialog::new()
+                                .set_title("Inspect Climate JSON / Schema")
+                                .add_filter("JSON", &["json"])
+                                .pick_file()
+                            {
+                                match std::fs::read_to_string(&in_file) {
+                                    Ok(raw) => {
+                                        match serde_json::from_str::<serde_json::Value>(&raw) {
+                                            Ok(val) => {
+                                                if let Some(app_ver) = val
+                                                    .get("application")
+                                                    .and_then(|a| a.get("version"))
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    let n_grp = val
+                                                        .get("layerGroups")
+                                                        .and_then(|g| g.as_array())
+                                                        .map(|a| a.len())
+                                                        .unwrap_or(0);
+                                                    self.export_status_msg = format!(
+                                                        "Schema v{} ({} groups) loaded from {}",
+                                                        app_ver,
+                                                        n_grp,
+                                                        in_file.display()
+                                                    );
+                                                } else if let Some(cnt) =
+                                                    val.get("cell_count").and_then(|c| c.as_u64())
+                                                {
+                                                    let lyr = val
+                                                        .get("layer_id")
+                                                        .and_then(|l| l.as_str())
+                                                        .unwrap_or("unknown");
+                                                    self.export_status_msg = format!(
+                                                        "Subset JSON ({}, {} cells) <- {}",
+                                                        lyr,
+                                                        cnt,
+                                                        in_file.display()
+                                                    );
+                                                } else {
+                                                    self.export_status_msg = format!(
+                                                        "Loaded valid JSON ({} bytes) <- {}",
+                                                        raw.len(),
+                                                        in_file.display()
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                self.export_status_msg =
+                                                    format!("Invalid JSON file: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.export_status_msg =
+                                            format!("Failed reading file: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    });
                     if !self.export_status_msg.is_empty() {
                         ui.small(&self.export_status_msg);
                     }
@@ -1002,8 +1255,16 @@ impl TerraTwinGuiApp {
                     }
 
                     let modes = self.workers.coordinator.schema().ui_layout.bottom_dock.modes.clone();
+                    let active_mode = modes
+                        .iter()
+                        .find(|m| m.id == self.temporal_mode_id);
+                    let mode_label = active_mode
+                        .map(|m| m.label.as_str())
+                        .unwrap_or(&self.temporal_mode_id);
+                    let mode_step = active_mode.map(|m| m.step.as_str()).unwrap_or("10m");
+                    let prev_mode = self.temporal_mode_id.clone();
                     egui::ComboBox::from_label("Mode")
-                        .selected_text(&self.temporal_mode_id)
+                        .selected_text(mode_label)
                         .show_ui(ui, |ui| {
                             for m in &modes {
                                 ui.selectable_value(
@@ -1013,6 +1274,37 @@ impl TerraTwinGuiApp {
                                 );
                             }
                         });
+                    if self.temporal_mode_id != prev_mode {
+                        let now = chrono::Utc::now();
+                        let present_year = now.year() as f64 + (now.ordinal() as f64 / 365.25);
+                        match self.temporal_mode_id.as_str() {
+                            "realtime_telemetry" => {
+                                self.sim_cfg.sim_year = present_year;
+                                self.sim_cfg.day_of_year = now.ordinal() as f64;
+                                self.sim_cfg.hour_utc =
+                                    now.hour() as f64 + (now.minute() as f64 / 60.0);
+                                self.sim_cfg.time_step_secs = 600.0;
+                            }
+                            "historical_reanalysis" => {
+                                self.sim_cfg.time_step_secs = 3600.0;
+                                self.sim_cfg.sim_year =
+                                    self.sim_cfg.sim_year.clamp(1950.0, present_year);
+                            }
+                            "cmip_projections" => {
+                                self.sim_cfg.time_step_secs = 3600.0;
+                                if self.sim_cfg.sim_year < 2026.0 {
+                                    self.sim_cfg.sim_year = 2050.0;
+                                } else {
+                                    self.sim_cfg.sim_year =
+                                        self.sim_cfg.sim_year.clamp(2026.0, 2100.0);
+                                }
+                            }
+                            _ => {}
+                        }
+                        self.playback_index = None;
+                        self.push_sim_update();
+                    }
+                    ui.small(format!("[Step: {}]", mode_step));
 
                     // Live vs 4D SQLite Replay Scrubber
                     let is_replay = self.playback_index.is_some();
@@ -1025,7 +1317,7 @@ impl TerraTwinGuiApp {
                         self.raster_dirty = true;
                     }
                     if ui
-                        .selectable_label(is_replay, "4D SQLite Replay")
+                        .selectable_label(is_replay, "4D Replay")
                         .clicked()
                     {
                         self.refresh_playback_timestamps();
@@ -1057,19 +1349,62 @@ impl TerraTwinGuiApp {
                             ui.monospace(ts);
                         }
                     } else {
+                        let now = chrono::Utc::now();
+                        let present_year = now.year() as f64 + (now.ordinal() as f64 / 365.25);
                         let mut time_changed = false;
-                        time_changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.sim_cfg.sim_year, 1950.0..=2100.0)
-                                    .text("Year"),
-                            )
-                            .changed();
-                        time_changed |= ui
-                            .add(
-                                egui::Slider::new(&mut self.sim_cfg.day_of_year, 1.0..=365.0)
-                                    .text("Day"),
-                            )
-                            .changed();
+                        match self.temporal_mode_id.as_str() {
+                            "realtime_telemetry" => {
+                                let lo_yr = present_year - 7.0 / 365.25;
+                                let hi_yr = present_year + 10.0 / 365.25;
+                                self.sim_cfg.sim_year = self.sim_cfg.sim_year.clamp(lo_yr, hi_yr);
+                                time_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.sim_cfg.sim_year, lo_yr..=hi_yr)
+                                            .text("Window"),
+                                    )
+                                    .changed();
+                                time_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.sim_cfg.hour_utc, 0.0..=23.9)
+                                            .text("UTC"),
+                                    )
+                                    .changed();
+                            }
+                            "historical_reanalysis" => {
+                                time_changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.sim_cfg.sim_year,
+                                            1950.0..=present_year,
+                                        )
+                                        .text("Year"),
+                                    )
+                                    .changed();
+                                time_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.sim_cfg.day_of_year, 1.0..=365.0)
+                                            .text("Day"),
+                                    )
+                                    .changed();
+                            }
+                            _ => {
+                                time_changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.sim_cfg.sim_year,
+                                            2026.0..=2100.0,
+                                        )
+                                        .text("Year"),
+                                    )
+                                    .changed();
+                                time_changed |= ui
+                                    .add(
+                                        egui::Slider::new(&mut self.sim_cfg.day_of_year, 1.0..=365.0)
+                                            .text("Day"),
+                                    )
+                                    .changed();
+                            }
+                        }
                         if time_changed {
                             self.push_sim_update();
                         }
@@ -1087,6 +1422,10 @@ impl TerraTwinGuiApp {
                     } else {
                         ui.small(self.workers.coordinator.current_ingest_status());
                     }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.small("Copyright CRV Science Network");
+                    });
                 });
             });
     }
@@ -1103,7 +1442,13 @@ impl TerraTwinGuiApp {
                 // Pan / Globe Rotate on drag
                 if response.dragged() {
                     let delta = response.drag_delta();
-                    let deg_per_px = 180.0 / (rect.height().max(120.0) as f64 * self.camera.zoom);
+                    let deg_per_px = match self.projection {
+                        MapProjectionKind::Equirectangular2d => {
+                            let (_, scale_y) = equirectangular_scales(aspect);
+                            180.0 / (rect.height().max(120.0) as f64 * self.camera.zoom * scale_y)
+                        }
+                        _ => 180.0 / (rect.height().max(120.0) as f64 * self.camera.zoom),
+                    };
                     self.camera.center_lon =
                         ((self.camera.center_lon - delta.x as f64 * deg_per_px + 540.0)
                             .rem_euclid(360.0))
@@ -1170,7 +1515,7 @@ impl TerraTwinGuiApp {
                     )
                 };
 
-                // 3D Globe atmosphere rim halo
+                // 3D Globe atmosphere rim halo or 2:1 Equirectangular plate carrée frame
                 if self.projection == MapProjectionKind::Globe3dWgs84 {
                     let r_px = 0.86 * (self.camera.zoom as f32) * (rect.height() * 0.5);
                     painter.circle_stroke(
@@ -1178,6 +1523,25 @@ impl TerraTwinGuiApp {
                         r_px,
                         Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(90, 195, 255, 130)),
                     );
+                } else if self.projection == MapProjectionKind::Equirectangular2d {
+                    let (scale_x, scale_y) = equirectangular_scales(aspect);
+                    let nx_max = (self.camera.zoom * scale_x) as f32;
+                    let ny_top = (((90.0 - self.camera.center_lat) / 90.0)
+                        * self.camera.zoom
+                        * scale_y) as f32;
+                    let ny_bot = (((-90.0 - self.camera.center_lat) / 90.0)
+                        * self.camera.zoom
+                        * scale_y) as f32;
+                    let tl = ndc_to_screen(-nx_max, ny_top);
+                    let br = ndc_to_screen(nx_max, ny_bot);
+                    let frame_rect = Rect::from_min_max(tl, br).intersect(rect);
+                    if frame_rect.is_positive() {
+                        painter.rect_stroke(
+                            frame_rect,
+                            0.0,
+                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(90, 145, 200, 110)),
+                        );
+                    }
                 }
 
                 // Graticule (30 deg parallels & meridians)
@@ -1500,21 +1864,142 @@ impl TerraTwinGuiApp {
                     }
                 }
 
-                // A->B Transect Line
-                if self.transect_points.len() == 2 {
-                    let (a_la, a_lo) = self.transect_points[0];
-                    let (b_la, b_lo) = self.transect_points[1];
-                    if let (Some((ax, ay)), Some((bx, by))) = (
-                        project_latlon_to_ndc(self.projection, &self.camera, a_la, a_lo, 0.0, aspect),
-                        project_latlon_to_ndc(self.projection, &self.camera, b_la, b_lo, 0.0, aspect),
+                // A->B Great-Circle SLERP Transect (64 segments)
+                if !self.transect_points.is_empty() {
+                    if let Some((ax, ay)) = project_latlon_to_ndc(
+                        self.projection,
+                        &self.camera,
+                        self.transect_points[0].0,
+                        self.transect_points[0].1,
+                        0.0,
+                        aspect,
                     ) {
                         let pa = ndc_to_screen(ax, ay);
-                        let pb = ndc_to_screen(bx, by);
-                        painter.line_segment([pa, pb], Stroke::new(2.4_f32, Color32::from_rgb(255, 210, 60)));
-                        painter.circle_filled(pa, 4.5, Color32::from_rgb(255, 210, 60));
-                        painter.circle_filled(pb, 4.5, Color32::from_rgb(255, 140, 60));
+                        painter.circle_filled(pa, 5.2, Color32::from_rgb(255, 210, 60));
+                        painter.circle_stroke(
+                            pa,
+                            5.2,
+                            Stroke::new(1.2_f32, Color32::from_rgb(10, 14, 24)),
+                        );
+                        painter.text(
+                            pa + egui::vec2(7.0, -7.0),
+                            Align2::LEFT_BOTTOM,
+                            "A",
+                            FontId::proportional(12.0),
+                            Color32::from_rgb(255, 225, 110),
+                        );
                     }
                 }
+                if self.transect_points.len() == 2 {
+                    let a = self.transect_points[0];
+                    let b = self.transect_points[1];
+                    let arc = slerp_great_circle(a, b, 64);
+                    let casing = Stroke::new(4.0_f32, Color32::from_rgba_unmultiplied(8, 12, 20, 210));
+                    let fg = Stroke::new(2.3_f32, Color32::from_rgb(255, 210, 60));
+
+                    if self.projection == MapProjectionKind::Equirectangular2d {
+                        let (scale_x, scale_y) = equirectangular_scales(aspect);
+                        let eq_to_screen = |lat: f64, dlon: f64| -> Pos2 {
+                            let nx = ((dlon / 180.0) * self.camera.zoom * scale_x) as f32;
+                            let ny = (((lat - self.camera.center_lat) / 90.0)
+                                * self.camera.zoom
+                                * scale_y) as f32;
+                            ndc_to_screen(nx, ny)
+                        };
+                        for win in arc.windows(2) {
+                            let p0 = win[0];
+                            let p1 = win[1];
+                            let dlon0 = ((p0.1 - self.camera.center_lon + 540.0).rem_euclid(360.0))
+                                - 180.0;
+                            let dlon1 = ((p1.1 - self.camera.center_lon + 540.0).rem_euclid(360.0))
+                                - 180.0;
+                            if (dlon1 - dlon0).abs() > 180.0 {
+                                let step_dlon = ((dlon1 - dlon0 + 540.0).rem_euclid(360.0)) - 180.0;
+                                if step_dlon.abs() > 1e-6 {
+                                    let edge_dlon = if step_dlon > 0.0 { 180.0 } else { -180.0 };
+                                    let frac = ((edge_dlon - dlon0) / step_dlon).clamp(0.0, 1.0);
+                                    let lat_seam = p0.0 + frac * (p1.0 - p0.0);
+                                    let s0 = eq_to_screen(p0.0, dlon0);
+                                    let s_edge_a = eq_to_screen(lat_seam, edge_dlon);
+                                    let s_edge_b = eq_to_screen(lat_seam, -edge_dlon);
+                                    let s1 = eq_to_screen(p1.0, dlon1);
+                                    painter.line_segment([s0, s_edge_a], casing);
+                                    painter.line_segment([s0, s_edge_a], fg);
+                                    painter.line_segment([s_edge_b, s1], casing);
+                                    painter.line_segment([s_edge_b, s1], fg);
+                                }
+                            } else {
+                                let s0 = eq_to_screen(p0.0, dlon0);
+                                let s1 = eq_to_screen(p1.0, dlon1);
+                                painter.line_segment([s0, s1], casing);
+                                painter.line_segment([s0, s1], fg);
+                            }
+                        }
+                    } else {
+                        for win in arc.windows(2) {
+                            let p0 = win[0];
+                            let p1 = win[1];
+                            if let (Some((nx0, ny0)), Some((nx1, ny1))) = (
+                                project_latlon_to_ndc(
+                                    self.projection,
+                                    &self.camera,
+                                    p0.0,
+                                    p0.1,
+                                    0.0,
+                                    aspect,
+                                ),
+                                project_latlon_to_ndc(
+                                    self.projection,
+                                    &self.camera,
+                                    p1.0,
+                                    p1.1,
+                                    0.0,
+                                    aspect,
+                                ),
+                            ) {
+                                let sp0 = ndc_to_screen(nx0, ny0);
+                                let sp1 = ndc_to_screen(nx1, ny1);
+                                if sp0.distance(sp1) < rect.width() * 0.35 {
+                                    painter.line_segment([sp0, sp1], casing);
+                                    painter.line_segment([sp0, sp1], fg);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((bx, by)) = project_latlon_to_ndc(
+                        self.projection,
+                        &self.camera,
+                        b.0,
+                        b.1,
+                        0.0,
+                        aspect,
+                    ) {
+                        let pb = ndc_to_screen(bx, by);
+                        painter.circle_filled(pb, 5.2, Color32::from_rgb(255, 140, 60));
+                        painter.circle_stroke(
+                            pb,
+                            5.2,
+                            Stroke::new(1.2_f32, Color32::from_rgb(10, 14, 24)),
+                        );
+                        painter.text(
+                            pb + egui::vec2(7.0, -7.0),
+                            Align2::LEFT_BOTTOM,
+                            "B",
+                            FontId::proportional(12.0),
+                            Color32::from_rgb(255, 180, 110),
+                        );
+                    }
+                }
+
+                // Bottom-Right Quantitative Viewport Colorbars
+                draw_viewport_colorbars(
+                    &painter,
+                    rect,
+                    self.workers.coordinator.schema(),
+                    &self.layer_states,
+                    self.anomaly_mode,
+                );
 
                 // Hover HUD Tooltip
                 if let Some(hover_pos) = response.hover_pos() {
@@ -1574,7 +2059,7 @@ impl TerraTwinGuiApp {
             }
         }
 
-        // Advance either 4D SQLite Replay ticks or Live simulation year when playing
+        // Advance either 4D SQLite Replay ticks or mode-aware Live simulation clock when playing
         if self.playing_timeline {
             if let Some(cur_idx) = self.playback_index {
                 if !self.playback_timestamps.is_empty()
@@ -1584,12 +2069,37 @@ impl TerraTwinGuiApp {
                     self.load_replay_snapshot_at_idx(next_idx);
                     self.playback_last_advance = std::time::Instant::now();
                 }
-            } else {
-                self.sim_cfg.sim_year += 0.25;
-                if self.sim_cfg.sim_year > 2100.0 {
-                    self.sim_cfg.sim_year = 1950.0;
+            } else if self.playback_last_advance.elapsed() >= std::time::Duration::from_millis(350)
+            {
+                let now = chrono::Utc::now();
+                let present_year = now.year() as f64 + (now.ordinal() as f64 / 365.25);
+                match self.temporal_mode_id.as_str() {
+                    "realtime_telemetry" => {
+                        let lo_yr = present_year - 7.0 / 365.25;
+                        let hi_yr = present_year + 10.0 / 365.25;
+                        self.sim_cfg.time_step_secs = 600.0;
+                        self.sim_cfg.advance_tick();
+                        if self.sim_cfg.sim_year > hi_yr || self.sim_cfg.sim_year < lo_yr {
+                            self.sim_cfg.sim_year = lo_yr;
+                        }
+                    }
+                    "historical_reanalysis" => {
+                        self.sim_cfg.time_step_secs = 3600.0;
+                        self.sim_cfg.sim_year += 0.5;
+                        if self.sim_cfg.sim_year > present_year {
+                            self.sim_cfg.sim_year = 1950.0;
+                        }
+                    }
+                    _ => {
+                        self.sim_cfg.time_step_secs = 3600.0;
+                        self.sim_cfg.sim_year += 0.5;
+                        if self.sim_cfg.sim_year > 2100.0 || self.sim_cfg.sim_year < 2026.0 {
+                            self.sim_cfg.sim_year = 2026.0;
+                        }
+                    }
                 }
                 self.push_sim_update();
+                self.playback_last_advance = std::time::Instant::now();
             }
         }
 
@@ -1600,6 +2110,7 @@ impl TerraTwinGuiApp {
         self.render_left_sidebar(ctx);
         self.render_right_analytics_drawer(ctx);
         self.render_central_map(ctx);
+        self.render_about_window(ctx);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(45));
     }
@@ -1625,20 +2136,50 @@ fn draw_readout_badge(ui: &mut egui::Ui, label: &str, value: &str, color: Color3
 }
 
 fn draw_sounding_canvas(ui: &mut egui::Ui, sounding: &[(f64, f64, f64, f64)]) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 145.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 150.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 20, 32));
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(42, 56, 78)));
+
+    let plot_left = rect.left() + 34.0;
+    let plot_right = rect.right() - 8.0;
+    let plot_top = rect.top() + 21.0;
+    let plot_bottom = rect.bottom() - 16.0;
 
     let map_pt = |p_hpa: f64, temp_c: f64| -> Pos2 {
         let y_frac = ((1000.0_f64.ln() - p_hpa.ln()) / (1000.0_f64.ln() - 10.0_f64.ln()))
             .clamp(0.0, 1.0) as f32;
         let x_frac = ((temp_c + 80.0) / 125.0).clamp(0.0, 1.0) as f32;
         egui::pos2(
-            rect.left() + 8.0 + x_frac * (rect.width() - 16.0),
-            rect.bottom() - 10.0 - y_frac * (rect.height() - 20.0),
+            plot_left + x_frac * (plot_right - plot_left),
+            plot_bottom - y_frac * (plot_bottom - plot_top),
         )
     };
+
+    for p_tick in [1000.0, 300.0, 10.0] {
+        let py = map_pt(p_tick, 0.0).y;
+        painter.line_segment(
+            [egui::pos2(plot_left, py), egui::pos2(plot_right, py)],
+            Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(120, 145, 180, 45)),
+        );
+        painter.text(
+            egui::pos2(plot_left - 4.0, py),
+            Align2::RIGHT_CENTER,
+            format!("{:.0}", p_tick),
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
+    for t_tick in [-60.0, 0.0, 30.0] {
+        let px = map_pt(500.0, t_tick).x;
+        painter.text(
+            egui::pos2(px, rect.bottom() - 3.0),
+            Align2::CENTER_BOTTOM,
+            format!("{:+.0}°C", t_tick),
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
 
     for win in sounding.windows(2) {
         let (p0, t0, td0, _) = win[0];
@@ -1653,36 +2194,66 @@ fn draw_sounding_canvas(ui: &mut egui::Ui, sounding: &[(f64, f64, f64, f64)]) {
         );
     }
     painter.text(
-        rect.left_top() + egui::vec2(8.0, 6.0),
+        rect.left_top() + egui::vec2(8.0, 4.0),
         Align2::LEFT_TOP,
-        "Red: Temp (°C) | Cyan: Dewpoint (°C)",
-        FontId::monospace(9.5),
+        "Red: Temp (°C) | Cyan: Dewpoint (°C) | hPa",
+        FontId::monospace(9.0),
         Color32::from_rgb(190, 205, 225),
     );
 }
 
 fn draw_ctd_canvas(ui: &mut egui::Ui, ctd: &[(f64, f64, f64)]) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 135.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 140.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(12, 22, 36));
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(42, 56, 78)));
+
+    let plot_left = rect.left() + 36.0;
+    let plot_right = rect.right() - 8.0;
+    let plot_top = rect.top() + 21.0;
+    let plot_bottom = rect.bottom() - 16.0;
 
     let map_temp = |z_m: f64, t_c: f64| -> Pos2 {
         let y_frac = (z_m / 6000.0).clamp(0.0, 1.0) as f32;
         let x_frac = ((t_c + 2.0) / 34.0).clamp(0.0, 1.0) as f32;
         egui::pos2(
-            rect.left() + 8.0 + x_frac * (rect.width() - 16.0),
-            rect.top() + 18.0 + y_frac * (rect.height() - 26.0),
+            plot_left + x_frac * (plot_right - plot_left),
+            plot_top + y_frac * (plot_bottom - plot_top),
         )
     };
     let map_sal = |z_m: f64, sal: f64| -> Pos2 {
         let y_frac = (z_m / 6000.0).clamp(0.0, 1.0) as f32;
         let x_frac = ((sal - 33.0) / 4.0).clamp(0.0, 1.0) as f32;
         egui::pos2(
-            rect.left() + 8.0 + x_frac * (rect.width() - 16.0),
-            rect.top() + 18.0 + y_frac * (rect.height() - 26.0),
+            plot_left + x_frac * (plot_right - plot_left),
+            plot_top + y_frac * (plot_bottom - plot_top),
         )
     };
+
+    for z_tick in [0.0, 3000.0, 6000.0] {
+        let py = map_temp(z_tick, 0.0).y;
+        painter.line_segment(
+            [egui::pos2(plot_left, py), egui::pos2(plot_right, py)],
+            Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(120, 145, 180, 45)),
+        );
+        painter.text(
+            egui::pos2(plot_left - 4.0, py),
+            Align2::RIGHT_CENTER,
+            format!("{:.0}m", z_tick),
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
+    for t_tick in [0.0, 15.0, 30.0] {
+        let px = map_temp(0.0, t_tick).x;
+        painter.text(
+            egui::pos2(px, rect.bottom() - 3.0),
+            Align2::CENTER_BOTTOM,
+            format!("{:.0}°C", t_tick),
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
 
     for win in ctd.windows(2) {
         let (z0, t0, s0) = win[0];
@@ -1697,43 +2268,250 @@ fn draw_ctd_canvas(ui: &mut egui::Ui, ctd: &[(f64, f64, f64)]) {
         );
     }
     painter.text(
-        rect.left_top() + egui::vec2(8.0, 5.0),
+        rect.left_top() + egui::vec2(8.0, 4.0),
         Align2::LEFT_TOP,
         "Orange: Ocean Temp (°C) | Teal: Salinity (PSU)",
-        FontId::monospace(9.5),
+        FontId::monospace(9.0),
         Color32::from_rgb(190, 205, 225),
     );
 }
 
-fn draw_cmip6_projection_canvas(ui: &mut egui::Ui, active_ssp: SspScenario, cur_year: f64) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 145.0), Sense::hover());
+fn draw_land_cryosphere_canvas(ui: &mut egui::Ui, cryo: &LandCryosphereProfile) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 140.0), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 22, 34));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(48, 64, 88)));
+
+    let plot_left = rect.left() + 34.0;
+    let plot_right = rect.right() - 8.0;
+    let plot_top = rect.top() + 21.0;
+    let plot_bottom = rect.bottom() - 16.0;
+
+    let t_min = cryo
+        .levels
+        .iter()
+        .map(|l| l.1)
+        .fold(-5.0_f64, f64::min)
+        .min(-5.0)
+        .floor();
+    let t_max = cryo
+        .levels
+        .iter()
+        .map(|l| l.1)
+        .fold(5.0_f64, f64::max)
+        .max(5.0)
+        .ceil();
+    let t_span = (t_max - t_min).max(5.0);
+
+    let map_temp = |z_m: f64, t_c: f64| -> Pos2 {
+        let y_frac = (z_m / 20.0).clamp(0.0, 1.0) as f32;
+        let x_frac = ((t_c - t_min) / t_span).clamp(0.0, 1.0) as f32;
+        egui::pos2(
+            plot_left + x_frac * (plot_right - plot_left),
+            plot_top + y_frac * (plot_bottom - plot_top),
+        )
+    };
+    let map_moist = |z_m: f64, w: f64| -> Pos2 {
+        let y_frac = (z_m / 20.0).clamp(0.0, 1.0) as f32;
+        let x_frac = (w / 0.50).clamp(0.0, 1.0) as f32;
+        egui::pos2(
+            plot_left + x_frac * (plot_right - plot_left),
+            plot_top + y_frac * (plot_bottom - plot_top),
+        )
+    };
+
+    for z_tick in [0.0, 10.0, 20.0] {
+        let py = map_temp(z_tick, t_min).y;
+        painter.line_segment(
+            [egui::pos2(plot_left, py), egui::pos2(plot_right, py)],
+            Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(120, 145, 180, 45)),
+        );
+        painter.text(
+            egui::pos2(plot_left - 4.0, py),
+            Align2::RIGHT_CENTER,
+            format!("{:.0}m", z_tick),
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
+
+    // 0 °C Freezing Isotherm
+    if t_min <= 0.0 && t_max >= 0.0 {
+        let x0 = map_temp(0.0, 0.0).x;
+        painter.line_segment(
+            [egui::pos2(x0, plot_top), egui::pos2(x0, plot_bottom)],
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(150, 220, 255, 115)),
+        );
+    }
+
+    if let Some(thaw_m) = cryo.active_layer_m {
+        let ty = map_temp(thaw_m.clamp(0.0, 20.0), t_min).y;
+        painter.line_segment(
+            [egui::pos2(plot_left, ty), egui::pos2(plot_right, ty)],
+            Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(255, 210, 80, 170)),
+        );
+    }
+
+    for (frac, val) in [(0.0, t_min), (0.5, 0.5 * (t_min + t_max)), (1.0, t_max)] {
+        let px = plot_left + frac * (plot_right - plot_left);
+        painter.text(
+            egui::pos2(px, rect.bottom() - 3.0),
+            if frac < 0.2 {
+                Align2::LEFT_BOTTOM
+            } else if frac > 0.8 {
+                Align2::RIGHT_BOTTOM
+            } else {
+                Align2::CENTER_BOTTOM
+            },
+            format!("{:+.0}°C", val),
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
+
+    for win in cryo.levels.windows(2) {
+        let (z0, t0, w0) = win[0];
+        let (z1, t1, w1) = win[1];
+        painter.line_segment(
+            [map_temp(z0, t0), map_temp(z1, t1)],
+            Stroke::new(2.0_f32, Color32::from_rgb(255, 145, 85)),
+        );
+        painter.line_segment(
+            [map_moist(z0, w0), map_moist(z1, w1)],
+            Stroke::new(1.6_f32, Color32::from_rgb(110, 220, 250)),
+        );
+    }
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 4.0),
+        Align2::LEFT_TOP,
+        "Orange: Ground T (°C) | Cyan: Unfrozen H₂O",
+        FontId::monospace(9.0),
+        Color32::from_rgb(190, 205, 225),
+    );
+}
+
+fn draw_cmip6_projection_canvas(
+    ui: &mut egui::Ui,
+    active_ssp: SspScenario,
+    cur_year: f64,
+    metric: Cmip6PlotMetric,
+    region: ClimateRegion,
+    pinned_lat: f64,
+    live_snapshot_val: Option<f64>,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 165.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 20, 32));
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(42, 56, 78)));
 
-    let map_yr_co2 = |yr: f64, ppm: f64| -> Pos2 {
+    let plot_left = rect.left() + 40.0;
+    let plot_right = rect.right() - 34.0;
+    let plot_top = rect.top() + 21.0;
+    let plot_bottom = rect.bottom() - 18.0;
+
+    let (y_min, y_max, y_ticks): (f64, f64, [f64; 3]) = match metric {
+        Cmip6PlotMetric::Co2Ppm => (300.0, 1180.0, [300.0, 740.0, 1150.0]),
+        Cmip6PlotMetric::DeltaTC => {
+            let max_dt = regional_cmip6_delta_t_c(SspScenario::Ssp5_85, 2100.0, region, pinned_lat)
+                .max(2.0);
+            let ceil_dt = (max_dt * 1.12).ceil().max(2.0);
+            (0.0, ceil_dt, [0.0, 0.5 * ceil_dt, ceil_dt])
+        }
+    };
+    let y_span = (y_max - y_min).max(1.0);
+
+    let eval_ssp = |ssp: SspScenario, yr: f64| -> f64 {
+        match metric {
+            Cmip6PlotMetric::Co2Ppm => ssp.co2_ppm_at_year(yr),
+            Cmip6PlotMetric::DeltaTC => regional_cmip6_delta_t_c(ssp, yr, region, pinned_lat),
+        }
+    };
+
+    let map_yr_val = |yr: f64, val: f64| -> Pos2 {
         let xf = ((yr - 1950.0) / 150.0).clamp(0.0, 1.0) as f32;
-        let yf = ((ppm - 300.0) / 860.0).clamp(0.0, 1.0) as f32;
+        let yf = ((val - y_min) / y_span).clamp(0.0, 1.0) as f32;
         egui::pos2(
-            rect.left() + 8.0 + xf * (rect.width() - 55.0),
-            rect.bottom() - 10.0 - yf * (rect.height() - 24.0),
+            plot_left + xf * (plot_right - plot_left),
+            plot_bottom - yf * (plot_bottom - plot_top),
         )
     };
 
+    // Y-axis ticks & grid lines
+    for yt in y_ticks {
+        let py = map_yr_val(1950.0, yt).y;
+        painter.line_segment(
+            [egui::pos2(plot_left, py), egui::pos2(plot_right, py)],
+            Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(120, 145, 180, 45)),
+        );
+        let lbl = match metric {
+            Cmip6PlotMetric::Co2Ppm => format!("{:.0}", yt),
+            Cmip6PlotMetric::DeltaTC => format!("+{:.1}°", yt),
+        };
+        painter.text(
+            egui::pos2(plot_left - 4.0, py),
+            Align2::RIGHT_CENTER,
+            lbl,
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
+
+    // X-axis year ticks
+    for yr_tick in [1950, 2000, 2050, 2100] {
+        let px = map_yr_val(yr_tick as f64, y_min).x;
+        painter.line_segment(
+            [egui::pos2(px, plot_bottom), egui::pos2(px, plot_bottom + 3.0)],
+            Stroke::new(0.8_f32, Color32::from_rgb(120, 145, 180)),
+        );
+        painter.text(
+            egui::pos2(px, rect.bottom() - 2.0),
+            Align2::CENTER_BOTTOM,
+            format!("{}", yr_tick),
+            FontId::monospace(8.5),
+            Color32::from_rgb(155, 175, 200),
+        );
+    }
+
+    // Compact 5-SSP color legend at top
+    let mut leg_x = rect.left() + 6.0;
+    for ssp in SspScenario::ALL {
+        let col = ssp_color(ssp);
+        let short = match ssp {
+            SspScenario::Ssp1_19 => "1-1.9",
+            SspScenario::Ssp1_26 => "1-2.6",
+            SspScenario::Ssp2_45 => "2-4.5",
+            SspScenario::Ssp3_70 => "3-7.0",
+            SspScenario::Ssp5_85 => "5-8.5",
+        };
+        painter.line_segment(
+            [
+                egui::pos2(leg_x, rect.top() + 9.0),
+                egui::pos2(leg_x + 10.0, rect.top() + 9.0),
+            ],
+            Stroke::new(if ssp == active_ssp { 2.4_f32 } else { 1.4_f32 }, col),
+        );
+        painter.text(
+            egui::pos2(leg_x + 12.0, rect.top() + 9.0),
+            Align2::LEFT_CENTER,
+            short,
+            FontId::monospace(8.5),
+            if ssp == active_ssp {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(170, 190, 215)
+            },
+        );
+        leg_x += 48.0;
+    }
+
     for ssp in SspScenario::ALL {
         let is_sel = ssp == active_ssp;
-        let col = match ssp {
-            SspScenario::Ssp1_19 => Color32::from_rgb(70, 200, 245),
-            SspScenario::Ssp1_26 => Color32::from_rgb(95, 225, 145),
-            SspScenario::Ssp2_45 => Color32::from_rgb(245, 205, 80),
-            SspScenario::Ssp3_70 => Color32::from_rgb(245, 130, 70),
-            SspScenario::Ssp5_85 => Color32::from_rgb(235, 65, 75),
-        };
+        let col = ssp_color(ssp);
         let stroke = Stroke::new(if is_sel { 2.4_f32 } else { 1.0_f32 }, col);
         let mut prev: Option<Pos2> = None;
         for yr_step in (1950..=2100).step_by(5) {
             let yr = yr_step as f64;
-            let pt = map_yr_co2(yr, ssp.co2_ppm_at_year(yr));
+            let pt = map_yr_val(yr, eval_ssp(ssp, yr));
             if let Some(p0) = prev {
                 painter.line_segment([p0, pt], stroke);
             }
@@ -1742,56 +2520,77 @@ fn draw_cmip6_projection_canvas(ui: &mut egui::Ui, active_ssp: SspScenario, cur_
     }
 
     // Current year vertical marker
-    let x_cur = map_yr_co2(cur_year, 400.0).x;
+    let x_cur = map_yr_val(cur_year, y_min).x;
     painter.line_segment(
         [
-            egui::pos2(x_cur, rect.top() + 14.0),
-            egui::pos2(x_cur, rect.bottom() - 8.0),
+            egui::pos2(x_cur, plot_top),
+            egui::pos2(x_cur, plot_bottom),
         ],
         Stroke::new(1.2_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
     );
 
+    if let Some(live_val) = live_snapshot_val {
+        if live_val.is_finite() {
+            let live_pt = map_yr_val(cur_year, live_val);
+            painter.circle_filled(live_pt, 4.2, Color32::WHITE);
+            painter.circle_stroke(live_pt, 4.2, Stroke::new(1.4_f32, ssp_color(active_ssp)));
+        }
+    }
+
     // 2100 Ensemble Spread Boxplot bar on right margin
-    let bx = rect.right() - 24.0;
-    let p10 = map_yr_co2(2100.0, SspScenario::Ssp1_19.co2_ppm_at_year(2100.0)).y;
-    let p25 = map_yr_co2(2100.0, SspScenario::Ssp1_26.co2_ppm_at_year(2100.0)).y;
-    let p50 = map_yr_co2(2100.0, SspScenario::Ssp2_45.co2_ppm_at_year(2100.0)).y;
-    let p75 = map_yr_co2(2100.0, SspScenario::Ssp3_70.co2_ppm_at_year(2100.0)).y;
-    let p90 = map_yr_co2(2100.0, SspScenario::Ssp5_85.co2_ppm_at_year(2100.0)).y;
-    painter.line_segment([egui::pos2(bx, p90), egui::pos2(bx, p10)], Stroke::new(1.5_f32, Color32::LIGHT_GRAY));
-    let box_rect = Rect::from_min_max(egui::pos2(bx - 8.0, p75), egui::pos2(bx + 8.0, p25));
+    let bx = rect.right() - 16.0;
+    let p10 = map_yr_val(2100.0, eval_ssp(SspScenario::Ssp1_19, 2100.0)).y;
+    let p25 = map_yr_val(2100.0, eval_ssp(SspScenario::Ssp1_26, 2100.0)).y;
+    let p50 = map_yr_val(2100.0, eval_ssp(SspScenario::Ssp2_45, 2100.0)).y;
+    let p75 = map_yr_val(2100.0, eval_ssp(SspScenario::Ssp3_70, 2100.0)).y;
+    let p90 = map_yr_val(2100.0, eval_ssp(SspScenario::Ssp5_85, 2100.0)).y;
+    painter.line_segment(
+        [egui::pos2(bx, p90), egui::pos2(bx, p10)],
+        Stroke::new(1.5_f32, Color32::LIGHT_GRAY),
+    );
+    let box_rect = Rect::from_min_max(egui::pos2(bx - 7.0, p75), egui::pos2(bx + 7.0, p25));
     painter.rect_filled(box_rect, 2.0, Color32::from_rgba_unmultiplied(90, 175, 245, 120));
     painter.rect_stroke(box_rect, 2.0, Stroke::new(1.2_f32, Color32::WHITE));
     painter.line_segment(
-        [egui::pos2(bx - 8.0, p50), egui::pos2(bx + 8.0, p50)],
+        [egui::pos2(bx - 7.0, p50), egui::pos2(bx + 7.0, p50)],
         Stroke::new(2.0_f32, Color32::from_rgb(255, 215, 70)),
     );
 }
 
+fn ssp_color(ssp: SspScenario) -> Color32 {
+    match ssp {
+        SspScenario::Ssp1_19 => Color32::from_rgb(70, 200, 245),
+        SspScenario::Ssp1_26 => Color32::from_rgb(95, 225, 145),
+        SspScenario::Ssp2_45 => Color32::from_rgb(245, 205, 80),
+        SspScenario::Ssp3_70 => Color32::from_rgb(245, 130, 70),
+        SspScenario::Ssp5_85 => Color32::from_rgb(235, 65, 75),
+    }
+}
+
 fn draw_transect_profile(
     ui: &mut egui::Ui,
+    schema: &HubSchema,
     snap_opt: &Option<TelemetrySnapshot>,
     layer_states: &HashMap<String, LayerUiState>,
     a: (f64, f64),
     b: (f64, f64),
 ) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 105.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(325.0, 110.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 20, 32));
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(42, 56, 78)));
     let Some(snap) = snap_opt else { return };
-    let n = 48usize;
+
+    let slerp_pts = slerp_great_circle(a, b, 64);
+    let n = slerp_pts.len();
     let Some((id, grid)) = snap
         .grids
         .iter()
         .filter(|(id, _)| layer_states.get(*id).map(|s| s.visible).unwrap_or(false))
         .max_by_key(|(_, g)| {
-            (0..n)
-                .filter(|&i| {
-                    let t = i as f64 / (n - 1) as f64;
-                    let la = a.0 + (b.0 - a.0) * t;
-                    let lo = a.1 + (b.1 - a.1) * t;
-                    sample_grid_bilinear(&g.values, g.width, g.height, la, lo).is_finite()
-                })
+            slerp_pts
+                .iter()
+                .filter(|&&(la, lo)| sample_grid_bilinear(&g.values, g.width, g.height, la, lo).is_finite())
                 .count()
         })
     else {
@@ -1799,10 +2598,7 @@ fn draw_transect_profile(
     };
 
     let mut vals = Vec::with_capacity(n);
-    for i in 0..n {
-        let t = i as f64 / (n - 1) as f64;
-        let la = a.0 + (b.0 - a.0) * t;
-        let lo = a.1 + (b.1 - a.1) * t;
+    for &(la, lo) in &slerp_pts {
         vals.push(sample_grid_bilinear(&grid.values, grid.width, grid.height, la, lo));
     }
     let min_v = grid.min_val;
@@ -1817,20 +2613,218 @@ fn draw_transect_profile(
         let yf = ((v - min_v) / span).clamp(0.0, 1.0);
         let pt = egui::pos2(
             rect.left() + 8.0 + xf * (rect.width() - 16.0),
-            rect.bottom() - 8.0 - yf * (rect.height() - 24.0),
+            rect.bottom() - 12.0 - yf * (rect.height() - 30.0),
         );
         if let Some(p0) = prev {
             painter.line_segment([p0, pt], Stroke::new(2.0_f32, Color32::from_rgb(255, 210, 65)));
         }
         prev = Some(pt);
     }
+
+    let (disp_name, units) = schema
+        .find_layer(id)
+        .map(|l| (l.name.as_str(), l.units.as_str()))
+        .unwrap_or((id.as_str(), ""));
+    let dist_km = haversine_km(a.0, a.1, b.0, b.1);
+    let short_name = truncate_ui_label(disp_name, 30);
+    let title = if units.is_empty() {
+        format!("{} | {:.0} km", short_name, dist_km)
+    } else {
+        format!("{} [{}] | {:.0} km", short_name, truncate_ui_label(units, 12), dist_km)
+    };
     painter.text(
         rect.left_top() + egui::vec2(8.0, 4.0),
         Align2::LEFT_TOP,
-        format!("Transect: {}", id),
-        FontId::monospace(9.5),
+        title,
+        FontId::monospace(9.0),
         Color32::LIGHT_GRAY,
     );
+    painter.text(
+        rect.left_bottom() + egui::vec2(8.0, -2.0),
+        Align2::LEFT_BOTTOM,
+        format!("A ({:.1}°, {:.1}°)", a.0, a.1),
+        FontId::monospace(8.0),
+        Color32::from_rgb(255, 210, 60),
+    );
+    painter.text(
+        rect.right_bottom() + egui::vec2(-8.0, -2.0),
+        Align2::RIGHT_BOTTOM,
+        format!("B ({:.1}°, {:.1}°)", b.0, b.1),
+        FontId::monospace(8.0),
+        Color32::from_rgb(255, 140, 60),
+    );
+}
+
+fn truncate_ui_label(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else if max_chars > 1 {
+        let mut out: String = s.chars().take(max_chars - 1).collect();
+        out.push('…');
+        out
+    } else {
+        String::new()
+    }
+}
+
+fn format_colorbar_tick(val: f32, span: f32) -> String {
+    let abs = val.abs();
+    if abs >= 1e5 || (abs > 0.0 && abs < 1e-2) {
+        format!("{:.1e}", val)
+    } else if span < 2.0 {
+        format!("{:.2}", val)
+    } else if span < 40.0 {
+        format!("{:.1}", val)
+    } else {
+        format!("{:.0}", val)
+    }
+}
+
+fn draw_viewport_colorbars(
+    painter: &egui::Painter,
+    rect: Rect,
+    schema: &HubSchema,
+    layer_states: &HashMap<String, LayerUiState>,
+    anomaly_mode: bool,
+) {
+    let mut visible_scalar = Vec::new();
+    for (_, lyr) in schema.all_layers() {
+        if lyr.id == "synoptic_fronts_isobars" || lyr.id == "teleconnection_oscillation_masks" {
+            continue;
+        }
+        if let Some(st) = layer_states.get(&lyr.id) {
+            if st.visible {
+                visible_scalar.push((lyr, st));
+            }
+        }
+    }
+    if visible_scalar.is_empty() {
+        return;
+    }
+    visible_scalar.reverse();
+    let total_vis = visible_scalar.len();
+    let shown = &visible_scalar[..total_vis.min(2)];
+
+    let card_w = 296.0_f32;
+    let card_h = 46.0_f32;
+    let gap = 6.0_f32;
+    let extra_pill_h = if total_vis > 2 { 18.0_f32 } else { 0.0_f32 };
+    let mut cur_bottom = rect.bottom() - 10.0;
+
+    if extra_pill_h > 0.0 {
+        let pill_rect = Rect::from_min_max(
+            egui::pos2(rect.right() - 12.0 - 140.0, cur_bottom - 16.0),
+            egui::pos2(rect.right() - 12.0, cur_bottom),
+        );
+        painter.rect_filled(
+            pill_rect,
+            4.0,
+            Color32::from_rgba_unmultiplied(10, 16, 26, 215),
+        );
+        painter.text(
+            pill_rect.center(),
+            Align2::CENTER_CENTER,
+            format!("+{} more visible layers", total_vis - 2),
+            FontId::monospace(9.0),
+            Color32::from_rgb(175, 200, 230),
+        );
+        cur_bottom -= extra_pill_h + 2.0;
+    }
+
+    for (lyr, st) in shown.iter().rev() {
+        let card_rect = Rect::from_min_max(
+            egui::pos2(rect.right() - 12.0 - card_w, cur_bottom - card_h),
+            egui::pos2(rect.right() - 12.0, cur_bottom),
+        );
+        painter.rect_filled(
+            card_rect,
+            4.0,
+            Color32::from_rgba_unmultiplied(10, 16, 26, 224),
+        );
+        painter.rect_stroke(
+            card_rect,
+            4.0,
+            Stroke::new(1.0_f32, Color32::from_rgb(52, 70, 96)),
+        );
+
+        let (pal, lo, hi, suffix) = if anomaly_mode {
+            let span = (st.max_range - st.min_range).abs().max(1e-3) * 0.45;
+            (ColormapPalette::CoolWarmDiverging, -span, span, " [Anom]")
+        } else {
+            (st.palette, st.min_range, st.max_range, "")
+        };
+        let span = (hi - lo).abs().max(1e-6);
+        let mid = 0.5 * (lo + hi);
+
+        let title_raw = if lyr.units.is_empty() {
+            format!("{}{}", lyr.name, suffix)
+        } else {
+            format!("{} [{}]{}", lyr.name, lyr.units, suffix)
+        };
+        let title = truncate_ui_label(&title_raw, 46);
+        let card_painter = painter.with_clip_rect(card_rect);
+        card_painter.text(
+            egui::pos2(card_rect.left() + 8.0, card_rect.top() + 4.0),
+            Align2::LEFT_TOP,
+            title,
+            FontId::proportional(10.0),
+            Color32::from_rgb(225, 238, 252),
+        );
+
+        let bar_left = card_rect.left() + 10.0;
+        let bar_right = card_rect.right() - 10.0;
+        let bar_top = card_rect.top() + 19.0;
+        let bar_bot = bar_top + 10.0;
+        let steps = 64usize;
+        let step_w = (bar_right - bar_left) / steps as f32;
+        for i in 0..steps {
+            let t = i as f32 / (steps - 1) as f32;
+            let [r, g, b] = pal.sample_rgb(t);
+            let sub = Rect::from_min_max(
+                egui::pos2(bar_left + i as f32 * step_w, bar_top),
+                egui::pos2(bar_left + (i + 1) as f32 * step_w + 0.5, bar_bot),
+            );
+            painter.rect_filled(sub, 0.0, Color32::from_rgb(r, g, b));
+        }
+        let bar_rect = Rect::from_min_max(
+            egui::pos2(bar_left, bar_top),
+            egui::pos2(bar_right, bar_bot),
+        );
+        painter.rect_stroke(bar_rect, 0.0, Stroke::new(0.8_f32, Color32::from_rgb(90, 115, 145)));
+
+        for frac in [0.0_f32, 0.5, 1.0] {
+            let tx = bar_left + frac * (bar_right - bar_left);
+            painter.line_segment(
+                [egui::pos2(tx, bar_bot), egui::pos2(tx, bar_bot + 2.5)],
+                Stroke::new(0.9_f32, Color32::from_rgb(175, 195, 220)),
+            );
+        }
+
+        painter.text(
+            egui::pos2(bar_left, bar_bot + 3.0),
+            Align2::LEFT_TOP,
+            format_colorbar_tick(lo, span),
+            FontId::monospace(9.0),
+            Color32::from_rgb(190, 210, 232),
+        );
+        painter.text(
+            egui::pos2(0.5 * (bar_left + bar_right), bar_bot + 3.0),
+            Align2::CENTER_TOP,
+            format_colorbar_tick(mid, span),
+            FontId::monospace(9.0),
+            Color32::from_rgb(190, 210, 232),
+        );
+        painter.text(
+            egui::pos2(bar_right, bar_bot + 3.0),
+            Align2::RIGHT_TOP,
+            format_colorbar_tick(hi, span),
+            FontId::monospace(9.0),
+            Color32::from_rgb(190, 210, 232),
+        );
+
+        cur_bottom -= card_h + gap;
+    }
 }
 
 fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
@@ -1854,7 +2848,9 @@ fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-fn write_rgba_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+/// Encode an RGBA buffer as a DEFLATE-compressed PNG using PNG Sub filtering (`1`)
+/// and `flate2` best zlib compression.
+pub fn write_rgba_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
     let row_bytes = width as usize * 4;
     if rgba.len() != row_bytes * height as usize {
         anyhow::bail!("Unexpected RGBA buffer length {}", rgba.len());
@@ -1866,25 +2862,17 @@ fn write_rgba_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) 
     }
     let mut raw = Vec::with_capacity((row_bytes + 1) * height as usize);
     for row in rgba.chunks_exact(row_bytes) {
-        raw.push(0);
-        raw.extend_from_slice(row);
+        // Filter type 1 (Sub): each byte minus the byte 4 positions left (same RGBA channel)
+        raw.push(1);
+        for (i, &b) in row.iter().enumerate() {
+            let left = if i >= 4 { row[i - 4] } else { 0 };
+            raw.push(b.wrapping_sub(left));
+        }
     }
-    let (mut s1, mut s2) = (1u32, 0u32);
-    for &b in &raw {
-        s1 = (s1 + b as u32) % 65521;
-        s2 = (s2 + s1) % 65521;
-    }
-    let mut zlib = Vec::with_capacity(raw.len() + (raw.len() / 65535 + 1) * 5 + 6);
-    zlib.extend_from_slice(&[0x78, 0x01]);
-    let n_chunks = raw.len().div_ceil(65535).max(1);
-    for (idx, chunk) in raw.chunks(65535).enumerate() {
-        zlib.push(if idx + 1 == n_chunks { 0x01 } else { 0x00 });
-        let len = chunk.len() as u16;
-        zlib.extend_from_slice(&len.to_le_bytes());
-        zlib.extend_from_slice(&(!len).to_le_bytes());
-        zlib.extend_from_slice(chunk);
-    }
-    zlib.extend_from_slice(&((s2 << 16) | s1).to_be_bytes());
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(&raw)?;
+    let zlib = encoder.finish()?;
 
     let push_chunk = |out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]| {
         out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -2003,6 +2991,10 @@ pub fn render_headless_screenshot(
         }
         app.raster_dirty = true;
     } else if view == 3 {
+        app.temporal_mode_id = "cmip_projections".to_string();
+        app.sim_cfg.time_step_secs = 3600.0;
+        app.cmip6_metric = Cmip6PlotMetric::DeltaTC;
+        app.cmip6_region = ClimateRegion::Global;
         app.sim_cfg.scenario = SspScenario::Ssp5_85;
         app.sim_cfg.sim_year = 2085.0;
         app.sim_cfg.ocean_depth_m = 450.0;
@@ -2153,11 +3145,22 @@ pub fn render_headless_screenshot(
 
 /// Launch the native hardware-accelerated desktop GUI window.
 pub fn launch_native_gui(workers: RunningWorkers) -> Result<()> {
+    let icon_rgba = include_bytes!(concat!(env!("OUT_DIR"), "/terratwin_icon_64.rgba")).to_vec();
+    let icon = egui::IconData {
+        rgba: icon_rgba,
+        width: 64,
+        height: 64,
+    };
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1520.0, 900.0])
             .with_min_inner_size([1024.0, 660.0])
-            .with_title("TerraTwin HPC Climate Modeling & Telemetry Hub (v2.4.0)"),
+            .with_icon(Arc::new(icon))
+            .with_title(format!(
+                "TerraTwin HPC Climate Modeling & Telemetry Hub (v{})",
+                env!("CARGO_PKG_VERSION")
+            )),
         ..Default::default()
     };
 

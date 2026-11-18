@@ -2,7 +2,7 @@
   "application": {
     "id": "planetary-climate-telemetry-hub",
     "name": "TerraTwin HPC Climate Modeling & Telemetry Hub",
-    "version": "2.4.0",
+    "version": "2.5.0",
     "architecture": "Zero-Dependency WebGPU/WebGL2 + Cloud-Optimized Zarr/PMTiles Streaming Engine",
     "computeBackend": {
       "ingestionEngine": "HPC Real-Time Level-1/2 Swath Assimilation & Downscaling",
