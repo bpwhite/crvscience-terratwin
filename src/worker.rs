@@ -58,6 +58,17 @@ pub struct RunningWorkers {
     ingest_thread: Option<JoinHandle<()>>,
 }
 
+impl RunningWorkers {
+    /// Construct a worker handle around a coordinator with no background threads (for headless unit tests).
+    pub fn without_threads(coordinator: Arc<BackgroundCoordinator>) -> Self {
+        Self {
+            coordinator,
+            sim_thread: None,
+            ingest_thread: None,
+        }
+    }
+}
+
 impl BackgroundCoordinator {
     pub fn new(schema: HubSchema, db: ClimateDatabase, initial_cfg: SimulationConfig) -> Arc<Self> {
         Arc::new(Self {

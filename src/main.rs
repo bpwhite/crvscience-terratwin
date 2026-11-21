@@ -16,7 +16,7 @@
 //! Unified binary entrypoint (`terratwin`) supporting both:
 //! 1. **Native Desktop Global Map GUI + Background Worker Threads** (`terratwin` or `terratwin gui`)
 //! 2. **Native Headless Background Daemon & CLI Utilities** (`terratwin --headless`, `terratwin daemon`,
-//!    `terratwin step`, `terratwin status`, `terratwin export`)
+//!    `terratwin step`, `terratwin status`, `terratwin export`, `terratwin prune`)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

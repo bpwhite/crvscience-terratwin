@@ -70,7 +70,7 @@ cargo test
 
 ## Citation & CRV Science Apps Hub
 
-* **CRV Science Apps Preprint (`APP-PREPRINT-10`)**: *TerraTwin: High-Performance Coupled Climate Telemetry and Multi-Scenario Shared Socioeconomic Pathway Projection Engine* — [https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp](https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp)
+* **CRV Science Apps Preprint (`APP-PREPRINT-10`)**: *TerraTwin: Fast Climate Projections for Global Warming, Sea-Level Rise, and Arctic Change* — [https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp](https://crvscience.com/apps/preprints/terratwin-coupled-climate-ssp)
 * **Concept DOI**: [`10.5281/zenodo.24222392`](https://doi.org/10.5281/zenodo.24222392)
 * **CRV Science Apps Hub**: [https://crvscience.com/apps](https://crvscience.com/apps)
 * **Machine-Readable Citation**: See [`CITATION.cff`](CITATION.cff) and headless empirical outputs in [`validation/`](validation/README.md).

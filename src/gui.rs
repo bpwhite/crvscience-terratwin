@@ -62,6 +62,27 @@ pub enum Cmip6PlotMetric {
     DeltaTC,
 }
 
+fn parse_lat_lon_query(input: &str) -> Option<(f64, f64)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = if trimmed.contains(',') {
+        trimmed.split(',').map(str::trim).collect()
+    } else {
+        trimmed.split_whitespace().collect()
+    };
+    if parts.len() != 2 {
+        return None;
+    }
+    let la = parts[0].parse::<f64>().ok()?;
+    let lo = parts[1].parse::<f64>().ok()?;
+    if !la.is_finite() || !lo.is_finite() {
+        return None;
+    }
+    Some((la.clamp(-90.0, 90.0), lo.clamp(-180.0, 180.0)))
+}
+
 #[derive(Debug, Clone)]
 struct LayerUiState {
     visible: bool,
@@ -657,17 +678,19 @@ impl TerraTwinGuiApp {
                     if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
                         || ui.button("Go").clicked()
                     {
-                        let parts: Vec<&str> = self.coord_search_buf.split(',').collect();
-                        if parts.len() == 2 {
-                            if let (Ok(la), Ok(lo)) = (
-                                parts[0].trim().parse::<f64>(),
-                                parts[1].trim().parse::<f64>(),
-                            ) {
-                                self.pinned_coord = (la.clamp(-90.0, 90.0), lo.clamp(-180.0, 180.0));
-                                self.camera.center_lat = self.pinned_coord.0;
-                                self.camera.center_lon = self.pinned_coord.1;
-                                self.raster_dirty = true;
+                        if let Some((la, lo)) = parse_lat_lon_query(&self.coord_search_buf) {
+                            self.pinned_coord = (la, lo);
+                            self.camera.center_lat = la;
+                            self.camera.center_lon = lo;
+                            if self.export_status_msg.starts_with("Invalid coordinates") {
+                                self.export_status_msg.clear();
                             }
+                            self.raster_dirty = true;
+                        } else {
+                            self.export_status_msg = format!(
+                                "Invalid coordinates '{}' (expected finite lat, lon)",
+                                self.coord_search_buf.trim()
+                            );
                         }
                     }
 
@@ -679,6 +702,7 @@ impl TerraTwinGuiApp {
                     }
                     if ui
                         .selectable_label(self.transect_mode, "Transect A-B")
+                        .on_hover_text("Click two map points to plot a great-circle A-B cross-section transect (Esc to cancel)")
                         .clicked()
                     {
                         self.transect_mode = !self.transect_mode;
@@ -694,6 +718,7 @@ impl TerraTwinGuiApp {
                     }
                     if ui
                         .selectable_label(self.about_open, "About")
+                        .on_hover_text("Show TerraTwin version, physics engines, and citation info (F1)")
                         .clicked()
                     {
                         self.about_open = !self.about_open;
@@ -742,6 +767,7 @@ impl TerraTwinGuiApp {
                 ui.horizontal(|ui| {
                     if ui
                         .checkbox(&mut self.anomaly_mode, "Anomaly Mode (vs Mean)")
+                        .on_hover_text("Render signed spatial deviations relative to each layer's global mean using a CoolWarm diverging colormap")
                         .changed()
                     {
                         self.raster_dirty = true;
@@ -777,12 +803,14 @@ impl TerraTwinGuiApp {
                             .logarithmic(true)
                             .text("Atm (hPa)"),
                     )
+                    .on_hover_text("Atmospheric isobaric pressure level (1000 hPa surface to 10 hPa stratosphere)")
                     .changed();
                 slice_changed |= ui
                     .add(
                         egui::Slider::new(&mut self.sim_cfg.ocean_depth_m, 0.0..=6000.0)
                             .text("Ocean (m)"),
                     )
+                    .on_hover_text("Subsurface ocean depth slice (0 m sea surface to 6000 m abyssal)")
                     .changed();
                 if slice_changed {
                     self.push_sim_update();
@@ -1249,6 +1277,7 @@ impl TerraTwinGuiApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .button(if self.playing_timeline { "Pause" } else { "Play" })
+                        .on_hover_text("Play or pause the 4D replay / climate timeline animation (Space)")
                         .clicked()
                     {
                         self.playing_timeline = !self.playing_timeline;
@@ -1421,6 +1450,13 @@ impl TerraTwinGuiApp {
                         ));
                     } else {
                         ui.small(self.workers.coordinator.current_ingest_status());
+                    }
+                    if !self.right_drawer_open && !self.export_status_msg.is_empty() {
+                        ui.separator();
+                        ui.small(
+                            egui::RichText::new(&self.export_status_msg)
+                                .color(Color32::from_rgb(245, 200, 95)),
+                        );
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -2041,6 +2077,29 @@ impl TerraTwinGuiApp {
 
 impl TerraTwinGuiApp {
     pub fn ui_step(&mut self, ctx: &egui::Context) {
+        let wants_kb = ctx.wants_keyboard_input();
+        let (f1_pressed, esc_pressed, space_pressed) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::F1),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Space),
+            )
+        });
+        if f1_pressed {
+            self.about_open = !self.about_open;
+        }
+        if esc_pressed {
+            if self.about_open {
+                self.about_open = false;
+            } else if self.transect_mode || !self.transect_points.is_empty() {
+                self.transect_mode = false;
+                self.transect_points.clear();
+            }
+        }
+        if !wants_kb && space_pressed {
+            self.playing_timeline = !self.playing_timeline;
+        }
+
         if self.last_timeline_refresh.elapsed() > std::time::Duration::from_secs(3) {
             self.refresh_playback_timestamps();
         }
@@ -3170,4 +3229,88 @@ pub fn launch_native_gui(workers: RunningWorkers) -> Result<()> {
         Box::new(|cc| Ok(Box::new(TerraTwinGuiApp::new(cc, workers)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe native window error: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::ClimateDatabase;
+    use crate::worker::BackgroundCoordinator;
+
+    fn run_key_step(app: &mut TerraTwinGuiApp, ctx: &egui::Context, key: egui::Key) {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_input, |c| {
+            app.ui_step(c);
+        });
+    }
+
+    #[test]
+    fn parse_lat_lon_query_guards_nan_inf_and_clamps() {
+        assert_eq!(parse_lat_lon_query("NaN, 0"), None);
+        assert_eq!(parse_lat_lon_query("inf, 10"), None);
+        assert_eq!(parse_lat_lon_query("10 -infinity"), None);
+        assert_eq!(parse_lat_lon_query("45.52 -122.68"), Some((45.52, -122.68)));
+        assert_eq!(parse_lat_lon_query("45.52, -122.68"), Some((45.52, -122.68)));
+        assert_eq!(parse_lat_lon_query("120.0, -250.0"), Some((90.0, -180.0)));
+        assert_eq!(parse_lat_lon_query("-120.0 250.0"), Some((-90.0, 180.0)));
+        assert_eq!(parse_lat_lon_query(""), None);
+        assert_eq!(parse_lat_lon_query("10, 20, 30"), None);
+    }
+
+    #[test]
+    fn headless_keyboard_shortcuts_f1_escape_and_space_transitions() {
+        let db_path = std::env::temp_dir().join(format!(
+            "terratwin_gui_shortcut_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let schema = HubSchema::load(None).expect("embedded schema");
+        let db = ClimateDatabase::open(&db_path).expect("temp db");
+        let coord = BackgroundCoordinator::new(schema, db, SimulationConfig::default());
+        let workers = RunningWorkers::without_threads(coord);
+
+        let mut app = TerraTwinGuiApp::new_headless(workers);
+        app.transect_mode = true;
+        app.transect_points = vec![(12.5, -45.0)];
+        let ctx = egui::Context::default();
+
+        assert!(!app.about_open);
+        assert!(!app.playing_timeline);
+
+        run_key_step(&mut app, &ctx, egui::Key::F1);
+        assert!(app.about_open);
+
+        run_key_step(&mut app, &ctx, egui::Key::Space);
+        assert!(app.playing_timeline);
+
+        run_key_step(&mut app, &ctx, egui::Key::Space);
+        assert!(!app.playing_timeline);
+
+        run_key_step(&mut app, &ctx, egui::Key::Escape);
+        assert!(!app.about_open);
+        assert!(app.transect_mode);
+        assert_eq!(app.transect_points.len(), 1);
+
+        run_key_step(&mut app, &ctx, egui::Key::Escape);
+        assert!(!app.transect_mode);
+        assert!(app.transect_points.is_empty());
+
+        drop(app);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
 }

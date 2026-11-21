@@ -14,8 +14,8 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 //! TerraTwin HPC Climate Modeling & Telemetry Hub (`v2.5.0`).
-//! Core library crate exposing schema parsing, SQLite WAL persistence,
-//! async public climate telemetry ingestion, spherical reprojection & Barnes interpolation,
+//! Core library crate exposing schema parsing, SQLite WAL persistence & Zarr v3 export,
+//! async public climate telemetry ingestion, spherical reprojection & 3D-Var Mass-Wind Balance PCG assimilation,
 //! multi-threaded Rayon climate physics simulation, and optional native `eframe`/`egui` GUI.
 
 pub mod coastlines;
