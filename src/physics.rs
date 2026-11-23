@@ -1674,35 +1674,89 @@ pub fn step_ocean_reduced_gravity_and_gyre(
 }
 
 /// Bolton (1980) saturation vapor pressure in hPa for temperature `t_c` (°C).
+/// Guards the `-243.5 °C` Magnus singularity and non-finite inputs so extreme temperatures remain finite.
 #[inline]
 pub fn bolton_saturation_vapor_pressure_hpa(t_c: f64) -> f64 {
-    6.112 * ((17.67 * t_c) / (t_c + 243.5)).exp()
+    if t_c.is_nan() || t_c <= -243.5 {
+        return 0.0;
+    }
+    if t_c.is_infinite() {
+        return 6.112 * 17.67_f64.exp();
+    }
+    let denom = t_c + 243.5;
+    if denom <= 1.0e-6 {
+        return 0.0;
+    }
+    let exp_arg = ((17.67 * t_c) / denom).clamp(-100.0, 25.0);
+    let es = 6.112 * exp_arg.exp();
+    if es.is_finite() { es } else { 0.0 }
 }
 
 /// Saturation specific humidity `q_sat` (`kg kg^-1`) at temperature `t_c` (°C) and pressure `p_hpa`.
 #[inline]
 pub fn saturation_specific_humidity(t_c: f64, p_hpa: f64) -> f64 {
-    let es = bolton_saturation_vapor_pressure_hpa(t_c).min(0.85 * p_hpa);
-    (0.622 * es / (p_hpa - 0.378 * es)).clamp(1.0e-6, 0.045)
+    let p_safe = if p_hpa.is_finite() {
+        p_hpa.max(1.0)
+    } else {
+        1013.25
+    };
+    let es = bolton_saturation_vapor_pressure_hpa(t_c).min(0.85 * p_safe);
+    let denom = (p_safe - 0.378 * es).max(1.0e-6);
+    (0.622 * es / denom).clamp(1.0e-6, 0.045)
 }
 
 /// Bolton (1980, Eq. 43) Equivalent Potential Temperature `theta_e` (Kelvin) for frontal analysis & CAPE.
+/// Guards `-243.5 °C` singularities, dry/zero humidity (`q <= 0`), LCL denominator positivity, and non-finite inputs.
 #[inline]
 pub fn bolton_equivalent_potential_temp_k(t_c: f64, q_kg_kg: f64, p_hpa: f64) -> f64 {
-    let tk = (t_c + 273.15).max(180.0);
-    let r = (q_kg_kg / (1.0 - q_kg_kg).max(0.9)).clamp(1.0e-6, 0.05);
-    let e = (p_hpa * r / (0.622 + r)).max(1.0e-4);
-    // Lifting condensation level temperature T_L (Bolton Eq. 21)
-    let tl = 2840.0 / (3.5 * tk.ln() - e.ln() - 4.805) + 55.0;
-    let theta_dl = tk * (1000.0 / (p_hpa - e).max(10.0)).powf(0.2854) * (tk / tl).powf(0.28 * r);
-    theta_dl * ((3036.0 / tl - 1.78) * r * (1.0 + 0.448 * r)).exp()
+    let t_safe = if t_c.is_finite() {
+        t_c.clamp(-240.0, 150.0)
+    } else if t_c.is_sign_positive() {
+        150.0
+    } else {
+        -240.0
+    };
+    let tk = (t_safe + 273.15).clamp(180.0, 450.0);
+    let q_safe = if q_kg_kg.is_finite() {
+        q_kg_kg.clamp(0.0, 0.1)
+    } else if q_kg_kg.is_sign_positive() {
+        0.05
+    } else {
+        0.0
+    };
+    let r = (q_safe / (1.0 - q_safe).max(0.9)).clamp(1.0e-6, 0.05);
+    let p_safe = if p_hpa.is_finite() {
+        p_hpa.clamp(10.0, 5000.0)
+    } else if p_hpa.is_sign_positive() {
+        5000.0
+    } else {
+        10.0
+    };
+    let e = (p_safe * r / (0.622 + r)).max(1.0e-4);
+    // Lifting condensation level temperature T_L (Bolton Eq. 21) with safeguarded positive denominator
+    let tl_denom = (3.5 * tk.ln() - e.ln() - 4.805).max(1.0);
+    let tl = (2840.0 / tl_denom + 55.0).clamp(60.0, 1500.0);
+    let p_dry = (p_safe - e).max(10.0);
+    let theta_dl = tk * (1000.0 / p_dry).powf(0.2854) * (tk / tl).powf(0.28 * r);
+    let exp_arg = ((3036.0 / tl - 1.78) * r * (1.0 + 0.448 * r)).clamp(-20.0, 20.0);
+    let theta_e = theta_dl * exp_arg.exp();
+    if theta_e.is_finite() { theta_e } else { tk }
 }
 
 /// Stull (2011) empirical Wet-Bulb Temperature (°C) from dry-bulb `t_c` (°C) and `rh_pct` (5–99%).
 #[inline]
 pub fn stull_wet_bulb_celsius(t_c: f64, rh_pct: f64) -> f64 {
-    let rh = rh_pct.clamp(5.0, 99.0);
-    t_c * (0.151_977 * (rh + 8.313_659).sqrt()).atan() + (t_c + rh).atan()
+    let t = if t_c.is_finite() {
+        t_c.clamp(-100.0, 80.0)
+    } else {
+        15.0
+    };
+    let rh = if rh_pct.is_finite() {
+        rh_pct.clamp(5.0, 99.0)
+    } else {
+        5.0
+    };
+    t * (0.151_977 * (rh + 8.313_659).sqrt()).atan() + (t + rh).atan()
         - (rh - 1.676_331).atan()
         + 0.003_918_38 * rh.powf(1.5) * (0.023_101 * rh).atan()
         - 4.686_035
@@ -1716,17 +1770,41 @@ pub fn compute_outdoor_wbgt(t_c: f64, rh_pct: f64, shortwave_wm2: f64, wind_ms: 
     0.7 * tw + 0.2 * tg + 0.1 * t_c
 }
 
-/// IPCC AR6 / Myhre et al. (1998) CO2 radiative forcing (W m^-2) relative to 1750 pre-industrial (278 ppm).
+/// IPCC AR6 / Etminan et al. (2016) CO2 effective radiative forcing per doubling (`W m^-2`).
+pub const CO2_FORCING_2X_AR6_WM2: f64 = 3.93;
+/// 1750 pre-industrial CO2 reference concentration (`ppm`).
+pub const CO2_PREINDUSTRIAL_PPM: f64 = 278.0;
+/// IPCC AR6 best-estimate Equilibrium Climate Sensitivity (`ECS`, °C per `2x CO2`).
+pub const CLIMATE_SENSITIVITY_ECS_C: f64 = 3.0;
+/// Realized transient response fraction (`TCR_eff / ECS = 2.16 / 3.0 = 0.72`).
+pub const TRANSIENT_CLIMATE_FRACTION: f64 = 0.72;
+
+/// IPCC AR6 / Etminan et al. (2016) CO2 effective radiative forcing (`W m^-2`) relative to 1750
+/// pre-industrial (278 ppm), calibrated to `F_{2xCO2} = 3.93 W m^-2` (`alpha_AR6 = 3.93 / ln(2) ≈ 5.67 W m^-2`).
 #[inline]
 pub fn co2_radiative_forcing_wm2(co2_ppm: f64) -> f64 {
-    5.35 * (co2_ppm.max(180.0) / 278.0).ln()
+    let c = if co2_ppm.is_finite() {
+        co2_ppm.max(180.0)
+    } else if co2_ppm.is_sign_positive() {
+        10_000.0
+    } else {
+        180.0
+    };
+    (CO2_FORCING_2X_AR6_WM2 / std::f64::consts::LN_2) * (c / CO2_PREINDUSTRIAL_PPM).ln()
+}
+
+/// Equilibrium global mean surface warming (°C over 1850–1900 pre-industrial) from CO2 forcing
+/// using IPCC AR6 `ECS = 3.0 °C` per doubling (`3.93 W m^-2`).
+#[inline]
+pub fn equilibrium_global_warming_c(co2_ppm: f64) -> f64 {
+    (co2_radiative_forcing_wm2(co2_ppm) / CO2_FORCING_2X_AR6_WM2) * CLIMATE_SENSITIVITY_ECS_C
 }
 
 /// Transient global mean surface warming (°C over 1850–1900 pre-industrial) from CO2 forcing
-/// (`ECS = 3.0 °C` per doubling `3.71 W m^-2`, realized transient climate response fraction `0.72`).
+/// (`ECS = 3.0 °C` per doubling `3.93 W m^-2`, realized transient climate response fraction `0.72`).
 #[inline]
-pub fn equilibrium_global_warming_c(co2_ppm: f64) -> f64 {
-    (co2_radiative_forcing_wm2(co2_ppm) / 3.71) * 3.0 * 0.72
+pub fn transient_global_warming_c(co2_ppm: f64) -> f64 {
+    equilibrium_global_warming_c(co2_ppm) * TRANSIENT_CLIMATE_FRACTION
 }
 
 /// Latitudinal polar amplification factor (asymmetric Arctic vs Antarctic amplification).
@@ -1740,9 +1818,64 @@ pub fn polar_amplification_factor(lat_deg: f64) -> f64 {
     }
 }
 
+/// Van Wagner (1987) / Lawson & Armitage (2008) latitude-band monthly effective daylength factors
+/// `(Le, Lf)` for the Duff Moisture Code (DMC) and Drought Code (DC).
+#[inline]
+pub fn van_wagner_daylength_factors(lat_deg: f64, month_1_to_12: u32) -> (f64, f64) {
+    const DMC_LE_NH_HIGH: [f64; 12] = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.0, 6.0];
+    const DMC_LE_NH_LOW: [f64; 12] = [7.9, 8.4, 8.9, 9.5, 9.9, 10.2, 10.1, 9.7, 9.1, 8.6, 8.1, 7.8];
+    const DMC_LE_EQ: [f64; 12] = [9.0; 12];
+    const DMC_LE_SH_LOW: [f64; 12] = [10.1, 9.7, 9.1, 8.6, 8.1, 7.8, 7.9, 8.4, 8.9, 9.5, 9.9, 10.2];
+    const DMC_LE_SH_HIGH: [f64; 12] = [12.4, 10.9, 9.4, 8.0, 7.0, 6.0, 6.5, 7.5, 9.0, 12.8, 13.9, 13.9];
+
+    const DC_LF_NH: [f64; 12] = [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6];
+    const DC_LF_EQ: [f64; 12] = [1.4; 12];
+    const DC_LF_SH: [f64; 12] = [6.4, 5.0, 2.4, 0.4, -1.6, -1.6, -1.6, -1.6, -1.6, 0.9, 3.8, 5.8];
+
+    let idx = (month_1_to_12.clamp(1, 12) - 1) as usize;
+    let lat = if lat_deg.is_finite() {
+        lat_deg.clamp(-90.0, 90.0)
+    } else {
+        45.0
+    };
+    let le = if lat > 30.0 {
+        DMC_LE_NH_HIGH[idx]
+    } else if lat > 10.0 {
+        DMC_LE_NH_LOW[idx]
+    } else if lat >= -10.0 {
+        DMC_LE_EQ[idx]
+    } else if lat >= -30.0 {
+        DMC_LE_SH_LOW[idx]
+    } else {
+        DMC_LE_SH_HIGH[idx]
+    };
+    let lf = if lat > 20.0 {
+        DC_LF_NH[idx]
+    } else if lat >= -20.0 {
+        DC_LF_EQ[idx]
+    } else {
+        DC_LF_SH[idx]
+    };
+    (le, lf)
+}
+
+#[inline]
+fn doy_to_month_1_to_12(day_of_year: f64) -> u32 {
+    let doy = if day_of_year.is_finite() {
+        day_of_year.round().clamp(1.0, 365.0) as u32
+    } else {
+        195
+    };
+    NaiveDate::from_yo_opt(2025, doy)
+        .map(|d| d.month())
+        .unwrap_or(7)
+}
+
 /// Full 6-component Van Wagner & Pickett (1985) / Van Wagner (1987) Canadian Forest Fire Weather Index
-/// stepped from prior fuel moisture codes `(prev_ffmc, prev_dmc, prev_dc)`.
-pub fn step_van_wagner_fwi(
+/// stepped from prior fuel moisture codes `(prev_ffmc, prev_dmc, prev_dc)` using latitude/month
+/// effective daylength tables `(Le, Lf)`.
+#[allow(clippy::too_many_arguments)]
+pub fn step_van_wagner_fwi_at_location(
     t_c: f64,
     rh_pct: f64,
     wind_ms: f64,
@@ -1750,14 +1883,34 @@ pub fn step_van_wagner_fwi(
     prev_ffmc: f64,
     prev_dmc: f64,
     prev_dc: f64,
+    lat_deg: f64,
+    month_1_to_12: u32,
 ) -> FireWeatherComponents {
-    let rh = rh_pct.clamp(5.0, 100.0);
-    let wind_kmh = (wind_ms.max(0.0) * 3.6).min(120.0);
-    let rain = precip_24h_mm.max(0.0);
+    let t_safe = if t_c.is_finite() {
+        t_c.clamp(-80.0, 70.0)
+    } else {
+        15.0
+    };
+    let rh = if rh_pct.is_finite() {
+        rh_pct.clamp(5.0, 100.0)
+    } else {
+        50.0
+    };
+    let wind_kmh = if wind_ms.is_finite() {
+        (wind_ms.max(0.0) * 3.6).min(120.0)
+    } else {
+        0.0
+    };
+    let rain = if precip_24h_mm.is_finite() {
+        precip_24h_mm.max(0.0)
+    } else {
+        0.0
+    };
+    let (le, lf) = van_wagner_daylength_factors(lat_deg, month_1_to_12);
 
     // 1. Fine Fuel Moisture Code (FFMC)
-    let mut m0 = 147.2 * (101.0 - prev_ffmc.clamp(0.0, 101.0))
-        / (59.5 + prev_ffmc.clamp(0.0, 101.0));
+    let ffmc_clamped = prev_ffmc.clamp(0.0, 101.0);
+    let mut m0 = 147.2 * (101.0 - ffmc_clamped) / (59.5 + ffmc_clamped);
     if rain > 0.5 {
         let rf = rain - 0.5;
         let mr = if m0 <= 150.0 {
@@ -1770,27 +1923,27 @@ pub fn step_van_wagner_fwi(
     }
     let ed = 0.942 * rh.powf(0.679)
         + 11.0 * ((rh - 100.0) / 10.0).exp()
-        + 0.18 * (21.1 - t_c) * (1.0 - (-0.115 * rh).exp());
+        + 0.18 * (21.1 - t_safe) * (1.0 - (-0.115 * rh).exp());
     let ew = 0.618 * rh.powf(0.753)
         + 10.0 * ((rh - 100.0) / 10.0).exp()
-        + 0.18 * (21.1 - t_c) * (1.0 - (-0.115 * rh).exp());
+        + 0.18 * (21.1 - t_safe) * (1.0 - (-0.115 * rh).exp());
 
     let m = if m0 > ed {
         let ko = 0.424 * (1.0 - (rh / 100.0).powf(1.7))
             + 0.0694 * wind_kmh.sqrt() * (1.0 - (rh / 100.0).powi(8));
-        let kd = ko * 0.581 * (0.0365 * t_c).exp();
+        let kd = ko * 0.581 * (0.0365 * t_safe).exp();
         ed + (m0 - ed) * 10.0_f64.powf(-kd)
     } else if m0 < ew {
         let k1 = 0.424 * (1.0 - ((100.0 - rh) / 100.0).powf(1.7))
             + 0.0694 * wind_kmh.sqrt() * (1.0 - ((100.0 - rh) / 100.0).powi(8));
-        let kw = k1 * 0.581 * (0.0365 * t_c).exp();
+        let kw = k1 * 0.581 * (0.0365 * t_safe).exp();
         ew - (ew - m0) * 10.0_f64.powf(-kw)
     } else {
         m0
     };
     let ffmc = (59.5 * (250.0 - m) / (147.2 + m)).clamp(0.0, 101.0);
 
-    // 2. Duff Moisture Code (DMC)
+    // 2. Duff Moisture Code (DMC) with latitude/month effective daylength Le
     let mut p0 = prev_dmc.max(0.0);
     if rain > 1.5 {
         let re = 0.92 * rain - 1.27;
@@ -1805,10 +1958,10 @@ pub fn step_van_wagner_fwi(
         let mr = mo + (1000.0 * re) / (48.77 + b * re);
         p0 = (244.72 - 43.43 * (mr - 20.0).max(1.0).ln()).max(0.0);
     }
-    let k_dmc = 1.894 * (t_c.max(-1.1) + 1.1) * (100.0 - rh) * 9.0e-6;
+    let k_dmc = 1.894 * (t_safe.max(-1.1) + 1.1) * (100.0 - rh) * (le * 1.0e-6);
     let dmc = (p0 + 100.0 * k_dmc).clamp(0.0, 300.0);
 
-    // 3. Drought Code (DC)
+    // 3. Drought Code (DC) with latitude/month daylength adjustment Lf
     let mut d0 = prev_dc.max(0.0);
     if rain > 2.8 {
         let rd = 0.83 * rain - 1.27;
@@ -1816,7 +1969,7 @@ pub fn step_van_wagner_fwi(
         let qr = qo + 3.937 * rd;
         d0 = (400.0 * (800.0 / qr.max(1.0)).ln()).max(0.0);
     }
-    let v_dc = (0.36 * (t_c.max(-2.8) + 2.8) + 2.8).max(0.0);
+    let v_dc = (0.36 * (t_safe.max(-2.8) + 2.8) + lf).max(0.0);
     let dc = (d0 + 0.5 * v_dc).clamp(0.0, 1200.0);
 
     // 4. Initial Spread Index (ISI), Buildup Index (BUI), and Fire Weather Index (FWI)
@@ -1860,14 +2013,47 @@ pub fn step_van_wagner_fwi(
     }
 }
 
-/// Convenience steady-state wrapper preserving signature compatibility (`canadian_fire_weather_index`).
+/// Full 6-component Van Wagner & Pickett (1985) / Van Wagner (1987) Canadian Forest Fire Weather Index
+/// stepped from prior fuel moisture codes `(prev_ffmc, prev_dmc, prev_dc)` at standard mid-latitude
+/// fire-season reference (`45°N`, July `Le=12.4`, `Lf=6.4`).
+pub fn step_van_wagner_fwi(
+    t_c: f64,
+    rh_pct: f64,
+    wind_ms: f64,
+    precip_24h_mm: f64,
+    prev_ffmc: f64,
+    prev_dmc: f64,
+    prev_dc: f64,
+) -> FireWeatherComponents {
+    step_van_wagner_fwi_at_location(
+        t_c,
+        rh_pct,
+        wind_ms,
+        precip_24h_mm,
+        prev_ffmc,
+        prev_dmc,
+        prev_dc,
+        45.0,
+        7,
+    )
+}
+
+/// Steady-state Van Wagner FWI evaluated at a specific `(lat_deg, day_of_year)` using
+/// latitude-band monthly daylength tables `(Le, Lf)`.
 #[inline]
-pub fn canadian_fire_weather_index(t_c: f64, rh_pct: f64, wind_ms: f64, precip_mm_hr: f64) -> f64 {
-    // Initialize antecedent moisture codes from local hydro-thermal regime then step Van Wagner FWI
+pub fn canadian_fire_weather_index_at(
+    t_c: f64,
+    rh_pct: f64,
+    wind_ms: f64,
+    precip_mm_hr: f64,
+    lat_deg: f64,
+    day_of_year: f64,
+) -> f64 {
     let init_ffmc = (92.0 - 0.35 * rh_pct).clamp(35.0, 96.0);
     let init_dmc = ((t_c + 5.0).max(0.0) * (100.0 - rh_pct) * 0.025).clamp(2.0, 120.0);
     let init_dc = ((t_c + 10.0).max(0.0) * (100.0 - rh_pct) * 0.12).clamp(15.0, 600.0);
-    step_van_wagner_fwi(
+    let month = doy_to_month_1_to_12(day_of_year);
+    step_van_wagner_fwi_at_location(
         t_c,
         rh_pct,
         wind_ms,
@@ -1875,24 +2061,97 @@ pub fn canadian_fire_weather_index(t_c: f64, rh_pct: f64, wind_ms: f64, precip_m
         init_ffmc,
         init_dmc,
         init_dc,
+        lat_deg,
+        month,
     )
     .fwi
 }
 
-/// UNESCO EOS-80 seawater density (`kg m^-3`).
+/// Convenience steady-state wrapper preserving signature compatibility (`canadian_fire_weather_index`).
 #[inline]
-pub fn eos80_seawater_density(temp_c: f64, salinity_psu: f64, depth_m: f64) -> f64 {
-    let rho_0 = 999.842_594 + 6.793_952e-2 * temp_c - 9.095_290e-3 * temp_c.powi(2)
-        + 1.001_685e-4 * temp_c.powi(3);
-    let haline = (0.824_493 - 4.0899e-3 * temp_c) * salinity_psu;
-    let compression = 4.5e-3 * depth_m;
-    rho_0 + haline + compression
+pub fn canadian_fire_weather_index(t_c: f64, rh_pct: f64, wind_ms: f64, precip_mm_hr: f64) -> f64 {
+    canadian_fire_weather_index_at(t_c, rh_pct, wind_ms, precip_mm_hr, 45.0, 195.0)
 }
 
-/// Iterative Newton-Raphson seawater carbonate equilibrium solver:
+/// Full UNESCO EOS-80 (1981) / Millero & Poisson (1981) seawater density (`kg m^-3`) at hydrostatic
+/// pressure `pressure_dbar` (`dbar`; `1 bar = 10 dbar`), including `B*S^1.5 + C*S^2` and the
+/// nonlinear secant bulk modulus `K(S, T, P)`.
+#[inline]
+pub fn eos80_seawater_density_at_pressure_dbar(
+    temp_c: f64,
+    salinity_psu: f64,
+    pressure_dbar: f64,
+) -> f64 {
+    let t = if temp_c.is_finite() {
+        temp_c.clamp(-5.0, 45.0)
+    } else {
+        15.0
+    };
+    let s = if salinity_psu.is_finite() {
+        salinity_psu.clamp(0.0, 45.0)
+    } else {
+        35.0
+    };
+    let p_dbar = if pressure_dbar.is_finite() {
+        pressure_dbar.clamp(0.0, 12_000.0)
+    } else {
+        0.0
+    };
+    // EOS-80 secant bulk modulus polynomial expects P in bars (1 bar = 10 dbar)
+    let p_bar = p_dbar * 0.1;
+
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let t4 = t3 * t;
+    let t5 = t4 * t;
+    let s_sqrt = s.sqrt();
+    let s32 = s * s_sqrt;
+    let s2 = s * s;
+
+    // 1. Pure water (SMOW) density at 1 atm (UNESCO 1981 / Bigg 1967)
+    let rho_w = 999.842_594 + 6.793_952e-2 * t - 9.095_290e-3 * t2 + 1.001_685e-4 * t3
+        - 1.120_083e-6 * t4
+        + 6.536_332e-9 * t5;
+
+    // 2. 1-atm seawater density rho(S, T, 0) (Millero & Poisson 1981)
+    let a_s = 0.824_493 - 4.089_9e-3 * t + 7.643_8e-5 * t2 - 8.246_7e-7 * t3 + 5.387_5e-9 * t4;
+    let b_s = -5.724_66e-3 + 1.022_7e-4 * t - 1.654_6e-6 * t2;
+    let c_s = 4.831_4e-4;
+    let rho_0 = rho_w + a_s * s + b_s * s32 + c_s * s2;
+
+    if p_bar <= 0.0 {
+        return rho_0;
+    }
+
+    // 3. Nonlinear secant bulk modulus K(S, T, P) in bars (Fofonoff & Millard 1983)
+    let k_w = 19_652.21 + 148.420_6 * t - 2.327_105 * t2 + 1.360_477e-2 * t3 - 5.155_288e-5 * t4;
+    let k_st0 = k_w
+        + s * (54.674_6 - 0.603_459 * t + 1.099_87e-2 * t2 - 6.167_0e-5 * t3)
+        + s32 * (7.944e-2 + 1.648_3e-2 * t - 5.300_9e-4 * t2);
+
+    let a_w = 3.239_908 + 1.437_13e-3 * t + 1.160_92e-4 * t2 - 5.779_05e-7 * t3
+        + s * (2.283_8e-3 - 1.098_1e-5 * t - 1.607_8e-6 * t2)
+        + 1.910_75e-4 * s32;
+
+    let b_w = 8.509_35e-5 - 6.122_93e-6 * t + 5.278_7e-8 * t2
+        + s * (-9.934_8e-7 + 2.081_6e-8 * t + 9.169_7e-10 * t2);
+
+    let k_stp = (k_st0 + a_w * p_bar + b_w * p_bar * p_bar).max(1.0e3);
+    let denom = (1.0 - p_bar / k_stp).max(0.5);
+    rho_0 / denom
+}
+
+/// UNESCO EOS-80 seawater density (`kg m^-3`) at depth `depth_m` (converting `1 m ≈ 1 dbar`).
+#[inline]
+pub fn eos80_seawater_density(temp_c: f64, salinity_psu: f64, depth_m: f64) -> f64 {
+    eos80_seawater_density_at_pressure_dbar(temp_c, salinity_psu, depth_m)
+}
+
+/// Iterative safeguarded Newton-Raphson + bisection seawater carbonate equilibrium solver:
 /// - Weiss (1974) CO2 solubility `K0(T, S)`
 /// - Lueker et al. (2000) carbonic acid dissociation constants `K1(T, S)` & `K2(T, S)`
 /// - Dickson (1990) boric acid `K_B(T, S)`
+/// - Millero (1995) / Dickson et al. (2007) Total-scale water auto-ionization `K_w(T, S)`
 /// - Mucci (1983) + Millero (1995) pressure-adjusted aragonite `K_sp(T, S, z)`
 pub fn solve_seawater_carbonate_chemistry(
     temp_c: f64,
@@ -1900,8 +2159,13 @@ pub fn solve_seawater_carbonate_chemistry(
     atm_co2_ppm: f64,
     depth_m: f64,
 ) -> SeawaterCarbonateState {
-    let tk = (temp_c.clamp(-2.0, 38.0) + 273.15).max(271.15);
-    let s = salinity_psu.clamp(28.0, 40.0);
+    let t_safe = if temp_c.is_finite() { temp_c } else { 15.0 };
+    let s_safe = if salinity_psu.is_finite() { salinity_psu } else { 35.0 };
+    let co2_safe = if atm_co2_ppm.is_finite() { atm_co2_ppm } else { 420.0 };
+    let z_safe = if depth_m.is_finite() { depth_m.max(0.0) } else { 0.0 };
+
+    let tk = (t_safe.clamp(-2.0, 38.0) + 273.15).max(271.15);
+    let s = s_safe.clamp(28.0, 40.0);
     let tk100 = tk / 100.0;
 
     // Weiss (1974) ln(K0) in mol kg^-1 atm^-1
@@ -1925,30 +2189,50 @@ pub fn solve_seawater_carbonate_chemistry(
     let kb = ln_kb.exp();
     let b_total = 0.0004157 * (s / 35.0); // mol kg^-1
 
+    // Millero (1995) / Dickson et al. (2007) water auto-ionization constant K_w (Total scale)
+    let ln_kw = 148.965_02 - 13_847.26 / tk - 23.6521 * tk.ln()
+        + (-5.977 + 118.67 / tk + 1.0495 * tk.ln()) * s.sqrt()
+        - 0.016_15 * s;
+    let kw = ln_kw.exp();
+
     // Remineralization increases subsurface pCO2 below the mixed layer
-    let remin_uatm = 260.0 * (1.0 - (-depth_m / 950.0).exp());
-    let pco2_uatm = (atm_co2_ppm + remin_uatm).max(180.0);
+    let remin_uatm = 260.0 * (1.0 - (-z_safe / 950.0).exp());
+    let pco2_uatm = (co2_safe + remin_uatm).max(120.0);
     let co2_aq = k0 * (pco2_uatm * 1.0e-6); // mol kg^-1
 
     // Lee et al. (2006) salinity-normalized Total Alkalinity (mol kg^-1)
     let ta = 0.002305 * (s / 35.0);
 
-    // Solve f([H+]) = [HCO3-] + 2[CO3^2-] + [B(OH)4-] - TA = 0 via safeguarded Newton-Raphson in pH
+    // Solve f(pH) = [HCO3-] + 2[CO3^2-] + [B(OH)4-] + [OH-] - [H+] - TA = 0
+    // using safeguarded Newton-Raphson with strict [ph_lo, ph_hi] bisection fallback.
+    let mut ph_lo = 5.5_f64;
+    let mut ph_hi = 9.5_f64;
     let mut ph = 8.10_f64;
-    for _ in 0..10 {
+    for _ in 0..40 {
         let h = 10.0_f64.powf(-ph);
         let hco3 = k1 * co2_aq / h;
         let co3 = k1 * k2 * co2_aq / (h * h);
         let boh4 = b_total * kb / (h + kb);
-        let alk_calc = hco3 + 2.0 * co3 + boh4;
+        let oh = kw / h;
+        let alk_calc = hco3 + 2.0 * co3 + boh4 + oh - h;
         let residual = alk_calc - ta;
-        if residual.abs() < 1.0e-9 {
+        if residual.abs() < 1.0e-12 {
             break;
         }
-        // Derivative d(alk_calc)/d(pH) = ln(10) * (hco3 + 4*co3 + boh4 * h / (h + kb))
-        let d_alk_dph =
-            std::f64::consts::LN_10 * (hco3 + 4.0 * co3 + boh4 * (h / (h + kb))).max(1.0e-9);
-        ph = (ph - residual / d_alk_dph).clamp(7.1, 8.6);
+        if residual < 0.0 {
+            ph_lo = ph_lo.max(ph);
+        } else {
+            ph_hi = ph_hi.min(ph);
+        }
+        // d(alk_calc)/d(pH) = ln(10) * ([HCO3-] + 4[CO3^2-] + [B(OH)4-]*[H+]/([H+]+K_B) + [OH-] + [H+]) > 0
+        let d_alk_dph = std::f64::consts::LN_10
+            * (hco3 + 4.0 * co3 + boh4 * (h / (h + kb)) + oh + h).max(1.0e-15);
+        let cand = ph - residual / d_alk_dph;
+        ph = if cand > ph_lo && cand < ph_hi {
+            cand
+        } else {
+            0.5 * (ph_lo + ph_hi)
+        };
     }
 
     let h_final = 10.0_f64.powf(-ph);
@@ -1960,7 +2244,7 @@ pub fn solve_seawater_carbonate_chemistry(
         + (-0.068393 + 0.0017276 * tk + 88.135 / tk) * s.sqrt()
         - 0.10018 * s
         + 0.0059415 * s.powf(1.5);
-    let p_bar = 0.1 * depth_m;
+    let p_bar = 0.1 * z_safe;
     // Aragonite becomes ~1.8x more soluble at 4000m (aragonite saturation horizon)
     let pressure_factor = ((36.0 * p_bar) / (83.145 * tk)).exp();
     let ksp_arag = 10.0_f64.powf(log10_ksp_0) * pressure_factor;
@@ -2559,7 +2843,7 @@ impl ClimateSimulationEngine {
         };
 
         let df_co2 = co2_radiative_forcing_wm2(base_co2_ppm);
-        let global_warming_over_preindustrial = equilibrium_global_warming_c(base_co2_ppm);
+        let global_warming_over_preindustrial = transient_global_warming_c(base_co2_ppm);
         let observed_enso = raw_osc
             .iter()
             .find(|s| s.latitude.abs() < 10.0)
@@ -3962,11 +4246,13 @@ impl ClimateSimulationEngine {
                             if !c.is_ocean {
                                 if c.t2m_c > 8.0 {
                                     let wind = c.u10_ms.hypot(c.v10_ms);
-                                    let fwi = canadian_fire_weather_index(
+                                    let fwi = canadian_fire_weather_index_at(
                                         c.t2m_c,
                                         c.rh_pct,
                                         wind,
                                         c.precip_mm_hr,
+                                        c.lat,
+                                        cfg.day_of_year,
                                     );
                                     let fuel_load = ((c.soil_moisture - 0.03) / 0.12).clamp(0.05, 1.0);
                                     let frp_mw = if fwi > 24.0 {
@@ -4049,11 +4335,13 @@ impl ClimateSimulationEngine {
                         for (i, c) in core_cells.iter().enumerate() {
                             if !c.is_ocean {
                                 let wind = c.u10_ms.hypot(c.v10_ms);
-                                values[i] = canadian_fire_weather_index(
+                                values[i] = canadian_fire_weather_index_at(
                                     c.t2m_c,
                                     c.rh_pct,
                                     wind,
                                     c.precip_mm_hr,
+                                    c.lat,
+                                    cfg.day_of_year,
                                 ) as f32;
                             } else {
                                 values[i] = f32::NAN;
@@ -4070,11 +4358,13 @@ impl ClimateSimulationEngine {
                                     c.shortwave_wm2,
                                     wind,
                                 );
-                                let fwi = canadian_fire_weather_index(
+                                let fwi = canadian_fire_weather_index_at(
                                     c.t2m_c,
                                     c.rh_pct,
                                     wind,
                                     c.precip_mm_hr,
+                                    c.lat,
+                                    cfg.day_of_year,
                                 );
                                 let pop_weight = (-((c.lat.abs() - 32.0) / 24.0).powi(2)).exp()
                                     + 0.45 * gauss2_earth(c.lat, c.lon, 27.0, 82.0, 9.0, 14.0)
@@ -4276,7 +4566,7 @@ pub fn regional_cmip6_delta_t_c(
     region: ClimateRegion,
     pinned_lat: f64,
 ) -> f64 {
-    let global_dt = equilibrium_global_warming_c(ssp.co2_ppm_at_year(year));
+    let global_dt = transient_global_warming_c(ssp.co2_ppm_at_year(year));
     let amp = match region {
         ClimateRegion::PinnedCell => polar_amplification_factor(pinned_lat),
         _ => {
@@ -4486,7 +4776,7 @@ fn compute_land_cryosphere_profile_impl(
 
     let base_t2m = preindustrial_baseline_t2m_c(lat, elev_m);
     let dt_anom = sample_opt("cmip6_downscaled_ensemble").unwrap_or_else(|| {
-        equilibrium_global_warming_c(scenario.co2_ppm_at_year(sim_year))
+        transient_global_warming_c(scenario.co2_ppm_at_year(sim_year))
             * polar_amplification_factor(lat)
     });
     let t_mean_annual = base_t2m + dt_anom;

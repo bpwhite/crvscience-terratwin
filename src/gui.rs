@@ -36,7 +36,8 @@ use crate::interp::{
     detect_mslp_extrema, detect_thermal_fronts, equirectangular_scales,
     extract_marching_squares_contours, fibonacci_sphere_points, haversine_km,
     project_latlon_to_ndc, sample_grid_bilinear, slerp_great_circle, unproject_ndc_to_latlon,
-    CameraState, ContourSegment, FrontSegment, MapProjectionKind, PressureExtrema,
+    zoom_camera_toward_ndc, CameraState, ContourSegment, FrontSegment, MapProjectionKind,
+    PressureExtrema,
 };
 use crate::physics::{
     compute_land_cryosphere_profile_from_grids_at_doy, compute_ocean_ctd_profile_from_grids,
@@ -60,6 +61,43 @@ use std::sync::Arc;
 pub enum Cmip6PlotMetric {
     Co2Ppm,
     DeltaTC,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickScenarioPreset {
+    BaselinePresent,
+    ModerateSsp245,
+    HighEmissionsSsp585,
+}
+
+impl QuickScenarioPreset {
+    pub const ALL: [QuickScenarioPreset; 3] = [
+        QuickScenarioPreset::BaselinePresent,
+        QuickScenarioPreset::ModerateSsp245,
+        QuickScenarioPreset::HighEmissionsSsp585,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            QuickScenarioPreset::BaselinePresent => "Baseline (Now)",
+            QuickScenarioPreset::ModerateSsp245 => "Moderate SSP2-4.5",
+            QuickScenarioPreset::HighEmissionsSsp585 => "High SSP5-8.5",
+        }
+    }
+
+    pub fn tooltip(&self) -> &'static str {
+        match self {
+            QuickScenarioPreset::BaselinePresent => {
+                "Present-day live telemetry baseline (SSP2-4.5, current UTC date, default layers)"
+            }
+            QuickScenarioPreset::ModerateSsp245 => {
+                "Mid-century moderate emissions (SSP2-4.5, Year 2050) highlighting CMIP6 ΔT, SST & fronts"
+            }
+            QuickScenarioPreset::HighEmissionsSsp585 => {
+                "End-of-century high emissions (SSP5-8.5, Year 2100) highlighting warming, SST, WBGT & surge"
+            }
+        }
+    }
 }
 
 fn parse_lat_lon_query(input: &str) -> Option<(f64, f64)> {
@@ -117,6 +155,7 @@ pub struct TerraTwinGuiApp {
 
     pinned_coord: (f64, f64),
     coord_search_buf: String,
+    layer_filter_query: String,
     temporal_mode_id: String,
     playing_timeline: bool,
     playback_timestamps: Vec<String>,
@@ -132,6 +171,7 @@ pub struct TerraTwinGuiApp {
     solo_restore_vis: Option<HashMap<String, bool>>,
     particles: Vec<LagrangianParticle>,
     map_texture: Option<TextureHandle>,
+    last_tex_size: (usize, usize),
     cached_snapshot: Option<TelemetrySnapshot>,
     cached_isobars: Vec<ContourSegment>,
     cached_extrema: Vec<PressureExtrema>,
@@ -209,6 +249,7 @@ impl TerraTwinGuiApp {
             transect_points: Vec::new(),
             pinned_coord: (cam_def.latitude, cam_def.longitude),
             coord_search_buf: format!("{:.4}, {:.4}", cam_def.latitude, cam_def.longitude),
+            layer_filter_query: String::new(),
             temporal_mode_id: "realtime_telemetry".to_string(),
             playing_timeline: false,
             playback_timestamps: Vec::new(),
@@ -222,6 +263,7 @@ impl TerraTwinGuiApp {
             solo_restore_vis: None,
             particles,
             map_texture: None,
+            last_tex_size: (0, 0),
             cached_snapshot: None,
             cached_isobars: Vec::new(),
             cached_extrema: Vec::new(),
@@ -230,6 +272,114 @@ impl TerraTwinGuiApp {
             last_raster_gen_key: 0,
             open_visible_groups_only: false,
         }
+    }
+
+    pub fn reset_camera(&mut self) {
+        let cam_def = &self.workers.coordinator.schema().main_viewport.camera_defaults;
+        self.camera = CameraState {
+            center_lon: cam_def.longitude,
+            center_lat: cam_def.latitude,
+            zoom: 1.0,
+            pitch_deg: cam_def.pitch_degrees,
+            bearing_deg: cam_def.bearing_degrees,
+            vertical_exaggeration: cam_def.vertical_exaggeration,
+        };
+        self.raster_dirty = true;
+    }
+
+    pub fn apply_quick_preset(&mut self, preset: QuickScenarioPreset) {
+        let schema = self.workers.coordinator.schema().clone();
+        self.solo_restore_vis = None;
+        self.playing_timeline = false;
+        match preset {
+            QuickScenarioPreset::BaselinePresent => {
+                let now = chrono::Utc::now();
+                self.sim_cfg.scenario = SspScenario::Ssp2_45;
+                self.sim_cfg.sim_year = now.year() as f64 + (now.ordinal() as f64 / 365.25);
+                self.sim_cfg.day_of_year = now.ordinal() as f64;
+                self.sim_cfg.hour_utc = now.hour() as f64 + (now.minute() as f64 / 60.0);
+                self.sim_cfg.time_step_secs = 600.0;
+                self.temporal_mode_id = "realtime_telemetry".to_string();
+                self.anomaly_mode = false;
+                for (_, lyr) in schema.all_layers() {
+                    if let Some(st) = self.layer_states.get_mut(&lyr.id) {
+                        st.visible = lyr.default_visible;
+                    }
+                }
+            }
+            QuickScenarioPreset::ModerateSsp245 => {
+                self.sim_cfg.scenario = SspScenario::Ssp2_45;
+                self.sim_cfg.sim_year = 2050.0;
+                self.sim_cfg.time_step_secs = 3600.0;
+                self.temporal_mode_id = "cmip_projections".to_string();
+                self.cmip6_metric = Cmip6PlotMetric::DeltaTC;
+                for st in self.layer_states.values_mut() {
+                    st.visible = false;
+                }
+                for id in [
+                    "cmip6_downscaled_ensemble",
+                    "sst_marine_heatwaves",
+                    "synoptic_fronts_isobars",
+                ] {
+                    if let Some(st) = self.layer_states.get_mut(id) {
+                        st.visible = true;
+                    }
+                }
+            }
+            QuickScenarioPreset::HighEmissionsSsp585 => {
+                self.sim_cfg.scenario = SspScenario::Ssp5_85;
+                self.sim_cfg.sim_year = 2100.0;
+                self.sim_cfg.time_step_secs = 3600.0;
+                self.temporal_mode_id = "cmip_projections".to_string();
+                self.cmip6_metric = Cmip6PlotMetric::DeltaTC;
+                for st in self.layer_states.values_mut() {
+                    st.visible = false;
+                }
+                for id in [
+                    "cmip6_downscaled_ensemble",
+                    "sst_marine_heatwaves",
+                    "wet_bulb_globe_temp_heat_stress",
+                    "coastal_inundation_storm_surge",
+                    "sea_ice_concentration_drift",
+                ] {
+                    if let Some(st) = self.layer_states.get_mut(id) {
+                        st.visible = true;
+                    }
+                }
+            }
+        }
+        self.push_sim_update();
+    }
+
+    fn step_timeline_by(&mut self, dir: i32) {
+        if let Some(cur_idx) = self.playback_index {
+            if dir < 0 && cur_idx > 0 {
+                self.load_replay_snapshot_at_idx(cur_idx - 1);
+            } else if dir > 0 && cur_idx + 1 < self.playback_timestamps.len() {
+                self.load_replay_snapshot_at_idx(cur_idx + 1);
+            }
+            return;
+        }
+        let now = chrono::Utc::now();
+        let present_year = now.year() as f64 + (now.ordinal() as f64 / 365.25);
+        match self.temporal_mode_id.as_str() {
+            "realtime_telemetry" => {
+                let lo_yr = present_year - 7.0 / 365.25;
+                let hi_yr = present_year + 10.0 / 365.25;
+                let step_yr = (dir as f64) * (1.0 / (365.25 * 24.0));
+                self.sim_cfg.sim_year = (self.sim_cfg.sim_year + step_yr).clamp(lo_yr, hi_yr);
+                self.sim_cfg.hour_utc = (self.sim_cfg.hour_utc + dir as f64).rem_euclid(24.0);
+            }
+            "historical_reanalysis" => {
+                self.sim_cfg.sim_year =
+                    (self.sim_cfg.sim_year + dir as f64).clamp(1950.0, present_year);
+            }
+            _ => {
+                self.sim_cfg.sim_year =
+                    (self.sim_cfg.sim_year + dir as f64).clamp(2026.0, 2100.0);
+            }
+        }
+        self.push_sim_update();
     }
 
     fn push_sim_update(&mut self) {
@@ -442,7 +592,24 @@ impl TerraTwinGuiApp {
                     let ndc_x = 2.0 * ((px as f64 + 0.5) / tex_w as f64) - 1.0;
                     let Some((lat, lon)) = unproject_ndc_to_latlon(proj, &cam, ndc_x, ndc_y, aspect)
                     else {
-                        *out_px = Color32::from_rgb(6, 10, 18);
+                        *out_px = if proj == MapProjectionKind::Globe3dWgs84 {
+                            let radius = 0.86 * cam.zoom;
+                            let sx = (ndc_x * aspect) / radius;
+                            let sy = ndc_y / radius;
+                            let rho = (sx * sx + sy * sy).sqrt();
+                            if rho <= 1.06 {
+                                let halo = ((-((rho - 1.0).max(0.0)) * 55.0).exp() * 0.42) as f32;
+                                Color32::from_rgb(
+                                    (6.0 + 48.0 * halo) as u8,
+                                    (10.0 + 145.0 * halo) as u8,
+                                    (18.0 + 225.0 * halo) as u8,
+                                )
+                            } else {
+                                Color32::from_rgb(6, 10, 18)
+                            }
+                        } else {
+                            Color32::from_rgb(6, 10, 18)
+                        };
                         continue;
                     };
 
@@ -565,7 +732,15 @@ impl TerraTwinGuiApp {
                         b = b * (1.0 - alpha) + (c_rgb[2] as f32) * alpha;
                     }
 
-                    *out_px = Color32::from_rgb(r as u8, g as u8, b as u8);
+                    *out_px = if proj == MapProjectionKind::Globe3dWgs84 {
+                        let radius = 0.86 * cam.zoom;
+                        let sx = (ndc_x * aspect) / radius;
+                        let sy = ndc_y / radius;
+                        let [sr, sg, sb] = apply_globe_lambert_fresnel([r, g, b], sx, sy);
+                        Color32::from_rgb(sr, sg, sb)
+                    } else {
+                        Color32::from_rgb(r as u8, g as u8, b as u8)
+                    };
                 }
             });
 
@@ -592,6 +767,7 @@ impl TerraTwinGuiApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .selectable_label(self.left_sidebar_open, "Layers")
+                        .on_hover_text("Toggle Left Predictive Layer Tree sidebar (L)")
                         .clicked()
                     {
                         self.left_sidebar_open = !self.left_sidebar_open;
@@ -611,24 +787,28 @@ impl TerraTwinGuiApp {
                             "2m Temp Anom",
                             &format!("{:+.2} °C", r.global_2m_temp_anomaly_c),
                             Color32::from_rgb(250, 130, 88),
+                            "Global cosine-area-weighted 2m surface air temperature anomaly vs 1850–1900 pre-industrial baseline (ECMWF ERA5 / GISTEMP + TerraTwin coupled QGPV/EBM solver)",
                         );
                         draw_readout_badge(
                             ui,
                             "Mauna Loa CO2",
                             &format!("{:.1} ppm", r.mauna_loa_co2_ppm),
                             Color32::from_rgb(245, 200, 75),
+                            "Atmospheric CO2 dry-air mole fraction (ppm) anchored to NOAA GML Mauna Loa Observatory & Meinshausen CMIP6 SSP pathways",
                         );
                         draw_readout_badge(
                             ui,
                             "ENSO Niño 3.4",
                             &format!("{:+.2} °C", r.enso_nino34_c),
                             Color32::from_rgb(120, 215, 250),
+                            "ENSO Niño 3.4 equatorial Pacific SST anomaly (5°S–5°N, 170°W–120°W) from NOAA CPC & 1.5-layer reduced-gravity ocean solver",
                         );
                         draw_readout_badge(
                             ui,
                             "Global SST Anom",
                             &format!("{:+.2} °C", r.global_sst_anomaly_c),
                             Color32::from_rgb(255, 160, 105),
+                            "Global 60°S–60°N Sea Surface Temperature anomaly relative to climatological baseline (NOAA OISST v2.1 / CoastWatch ERDDAP)",
                         );
                     }
                     ui.separator();
@@ -646,7 +826,9 @@ impl TerraTwinGuiApp {
                                     proj_changed = true;
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("Switch map projection (Keys 1–4)");
                     if proj_changed {
                         self.raster_dirty = true;
                     }
@@ -673,6 +855,7 @@ impl TerraTwinGuiApp {
                     ui.label("Coord:");
                     let edit = ui.add(
                         egui::TextEdit::singleline(&mut self.coord_search_buf)
+                            .id(egui::Id::new("terratwin_coord_search"))
                             .desired_width(125.0),
                     );
                     if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -712,9 +895,17 @@ impl TerraTwinGuiApp {
                     }
                     if ui
                         .selectable_label(self.right_drawer_open, "Analytics")
+                        .on_hover_text("Toggle Right Telemetry Analytics drawer (A)")
                         .clicked()
                     {
                         self.right_drawer_open = !self.right_drawer_open;
+                    }
+                    if ui
+                        .button("Reset View")
+                        .on_hover_text("Reset camera center, zoom, and bearing (R)")
+                        .clicked()
+                    {
+                        self.reset_camera();
                     }
                     if ui
                         .selectable_label(self.about_open, "About")
@@ -795,6 +986,60 @@ impl TerraTwinGuiApp {
                     });
 
                 ui.separator();
+                ui.label(egui::RichText::new("Quick Scenario Presets").strong());
+                let mut clicked_preset: Option<QuickScenarioPreset> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for preset in QuickScenarioPreset::ALL {
+                        let active = match preset {
+                            QuickScenarioPreset::BaselinePresent => {
+                                self.temporal_mode_id == "realtime_telemetry"
+                                    && self.sim_cfg.scenario == SspScenario::Ssp2_45
+                            }
+                            QuickScenarioPreset::ModerateSsp245 => {
+                                self.temporal_mode_id == "cmip_projections"
+                                    && self.sim_cfg.scenario == SspScenario::Ssp2_45
+                                    && (self.sim_cfg.sim_year - 2050.0).abs() < 1.0
+                            }
+                            QuickScenarioPreset::HighEmissionsSsp585 => {
+                                self.temporal_mode_id == "cmip_projections"
+                                    && self.sim_cfg.scenario == SspScenario::Ssp5_85
+                                    && (self.sim_cfg.sim_year - 2100.0).abs() < 1.0
+                            }
+                        };
+                        if ui
+                            .selectable_label(active, preset.label())
+                            .on_hover_text(preset.tooltip())
+                            .clicked()
+                        {
+                            clicked_preset = Some(preset);
+                        }
+                    }
+                });
+                if let Some(p) = clicked_preset {
+                    self.apply_quick_preset(p);
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("Camera & Bearing").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.camera.bearing_deg, -180.0..=180.0)
+                                .suffix("°")
+                                .text("Bearing"),
+                        )
+                        .on_hover_text("Rotate camera bearing (or Shift+Drag on the globe/polar map)")
+                        .changed()
+                    {
+                        self.raster_dirty = true;
+                    }
+                    if ui.small_button("0°").on_hover_text("Reset bearing to North-up").clicked() {
+                        self.camera.bearing_deg = 0.0;
+                        self.raster_dirty = true;
+                    }
+                });
+
+                ui.separator();
                 ui.label(egui::RichText::new("Vertical Slice Engine").strong());
                 let mut slice_changed = false;
                 slice_changed |= ui
@@ -817,18 +1062,51 @@ impl TerraTwinGuiApp {
                 }
 
                 ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Search:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.layer_filter_query)
+                            .id(egui::Id::new("terratwin_layer_filter"))
+                            .hint_text("Filter 34 layers...")
+                            .desired_width(190.0),
+                    );
+                    if !self.layer_filter_query.is_empty() && ui.small_button("✕").clicked() {
+                        self.layer_filter_query.clear();
+                    }
+                });
+
+                let filter_lc = self.layer_filter_query.trim().to_ascii_lowercase();
                 let groups = self.workers.coordinator.schema().layer_groups.clone();
                 let mut solo_clicked_id: Option<String> = None;
                 let visible_count = self.layer_states.values().filter(|s| s.visible).count();
+                let matching_count: usize = groups
+                    .iter()
+                    .flat_map(|g| g.layers.iter().map(move |l| (g, l)))
+                    .filter(|(g, l)| layer_matches_filter(g, l, &filter_lc))
+                    .count();
+                if !filter_lc.is_empty() {
+                    ui.small(format!("Showing {} of 34 layers", matching_count));
+                }
+
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for grp in &groups {
-                        let has_vis = grp.layers.iter().any(|l| {
+                        let matching_layers: Vec<_> = grp
+                            .layers
+                            .iter()
+                            .filter(|l| layer_matches_filter(grp, l, &filter_lc))
+                            .collect();
+                        if matching_layers.is_empty() {
+                            continue;
+                        }
+                        let has_vis = matching_layers.iter().any(|l| {
                             self.layer_states
                                 .get(&l.id)
                                 .map(|s| s.visible)
                                 .unwrap_or(false)
                         });
-                        let is_open = if self.open_visible_groups_only {
+                        let is_open = if !filter_lc.is_empty() {
+                            true
+                        } else if self.open_visible_groups_only {
                             has_vis
                         } else {
                             grp.default_expanded
@@ -838,7 +1116,7 @@ impl TerraTwinGuiApp {
                         )
                         .default_open(is_open)
                         .show(ui, |ui| {
-                            for lyr in &grp.layers {
+                            for lyr in matching_layers {
                                 let Some(st) = self.layer_states.get_mut(&lyr.id) else {
                                     continue;
                                 };
@@ -1451,7 +1729,7 @@ impl TerraTwinGuiApp {
                     } else {
                         ui.small(self.workers.coordinator.current_ingest_status());
                     }
-                    if !self.right_drawer_open && !self.export_status_msg.is_empty() {
+                    if !self.export_status_msg.is_empty() {
                         ui.separator();
                         ui.small(
                             egui::RichText::new(&self.export_status_msg)
@@ -1475,31 +1753,61 @@ impl TerraTwinGuiApp {
                 let rect = response.rect;
                 let aspect = (rect.width() / rect.height().max(1.0)) as f64;
 
-                // Pan / Globe Rotate on drag
+                // Pan / Globe Rotate (or Shift+Drag Bearing Rotate) on drag
                 if response.dragged() {
                     let delta = response.drag_delta();
-                    let deg_per_px = match self.projection {
-                        MapProjectionKind::Equirectangular2d => {
-                            let (_, scale_y) = equirectangular_scales(aspect);
-                            180.0 / (rect.height().max(120.0) as f64 * self.camera.zoom * scale_y)
-                        }
-                        _ => 180.0 / (rect.height().max(120.0) as f64 * self.camera.zoom),
-                    };
-                    self.camera.center_lon =
-                        ((self.camera.center_lon - delta.x as f64 * deg_per_px + 540.0)
-                            .rem_euclid(360.0))
-                            - 180.0;
-                    self.camera.center_lat =
-                        (self.camera.center_lat + delta.y as f64 * deg_per_px).clamp(-88.0, 88.0);
+                    let shift_held = ui.input(|i| i.modifiers.shift);
+                    if shift_held {
+                        self.camera.bearing_deg =
+                            ((self.camera.bearing_deg + delta.x as f64 * 0.45 + 180.0)
+                                .rem_euclid(360.0))
+                                - 180.0;
+                    } else {
+                        let deg_per_px = match self.projection {
+                            MapProjectionKind::Equirectangular2d => {
+                                let (_, scale_y) = equirectangular_scales(aspect);
+                                180.0
+                                    / (rect.height().max(120.0) as f64 * self.camera.zoom * scale_y)
+                            }
+                            _ => 180.0 / (rect.height().max(120.0) as f64 * self.camera.zoom),
+                        };
+                        let b = if self.projection == MapProjectionKind::Globe3dWgs84 {
+                            self.camera.bearing_deg.to_radians()
+                        } else {
+                            0.0
+                        };
+                        let sx = delta.x as f64;
+                        let sy = -(delta.y as f64);
+                        let raw_x = sx * b.cos() + sy * b.sin();
+                        let raw_y = -sx * b.sin() + sy * b.cos();
+                        self.camera.center_lon =
+                            ((self.camera.center_lon - raw_x * deg_per_px + 540.0)
+                                .rem_euclid(360.0))
+                                - 180.0;
+                        self.camera.center_lat =
+                            (self.camera.center_lat - raw_y * deg_per_px).clamp(-88.0, 88.0);
+                    }
                     self.raster_dirty = true;
                 }
 
-                // Zoom on mouse wheel
+                // Cursor-centered zoom on mouse wheel
                 if response.hovered() {
                     let scroll = ui.input(|i| i.raw_scroll_delta.y);
                     if scroll.abs() > 0.1 {
                         let factor = (1.0 + scroll as f64 * 0.0018).clamp(0.82, 1.22);
-                        self.camera.zoom = (self.camera.zoom * factor).clamp(0.55, 8.5);
+                        let cursor_ndc = response.hover_pos().map(|pos| {
+                            (
+                                2.0 * ((pos.x - rect.left()) / rect.width()) as f64 - 1.0,
+                                1.0 - 2.0 * ((pos.y - rect.top()) / rect.height()) as f64,
+                            )
+                        });
+                        zoom_camera_toward_ndc(
+                            self.projection,
+                            &mut self.camera,
+                            factor,
+                            cursor_ndc,
+                            aspect,
+                        );
                         self.raster_dirty = true;
                     }
                 }
@@ -1528,9 +1836,14 @@ impl TerraTwinGuiApp {
                     }
                 }
 
-                // Re-rasterize composite texture when dirty (0.85x viewport buffer for crisp Natural Earth coastlines & cloud detail)
-                let tex_w = ((rect.width() * 0.85) as usize).clamp(480, 1120);
-                let tex_h = ((rect.height() * 0.85) as usize).clamp(300, 760);
+                // Re-rasterize HiDPI-responsive composite texture when dirty or resized
+                let ppp = ctx.pixels_per_point().clamp(1.0, 2.5);
+                let tex_w = ((rect.width() * ppp * 0.85) as usize).clamp(480, 1920);
+                let tex_h = ((rect.height() * ppp * 0.85) as usize).clamp(300, 1280);
+                if (tex_w, tex_h) != self.last_tex_size {
+                    self.last_tex_size = (tex_w, tex_h);
+                    self.raster_dirty = true;
+                }
                 if self.raster_dirty || self.map_texture.is_none() {
                     self.rebuild_composite_texture(ctx, tex_w, tex_h);
                 }
@@ -1580,9 +1893,12 @@ impl TerraTwinGuiApp {
                     }
                 }
 
-                // Graticule (30 deg parallels & meridians)
+                // Graticule (30 deg parallels & meridians + degree labels)
                 let grat_stroke =
                     Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(180, 210, 240, 38));
+                let grat_label_col = Color32::from_rgba_unmultiplied(185, 214, 244, 165);
+                let mut placed_grat_labels: Vec<Pos2> = Vec::new();
+                let label_bounds = rect.shrink(22.0);
                 for lat_g in (-60..=60).step_by(30) {
                     let mut prev: Option<Pos2> = None;
                     for lon_g in (-180..=180).step_by(6) {
@@ -1603,6 +1919,55 @@ impl TerraTwinGuiApp {
                             prev = Some(pt);
                         } else {
                             prev = None;
+                        }
+                    }
+
+                    let candidate_pt = if self.projection == MapProjectionKind::Equirectangular2d {
+                        let (_, scale_y) = equirectangular_scales(aspect);
+                        let ny = (((lat_g as f64 - self.camera.center_lat) / 90.0)
+                            * self.camera.zoom
+                            * scale_y) as f32;
+                        let (scale_x, _) = equirectangular_scales(aspect);
+                        let left_x = ndc_to_screen(-(self.camera.zoom * scale_x) as f32, ny)
+                            .x
+                            .max(rect.left() + 8.0)
+                            + 4.0;
+                        let y = ndc_to_screen(0.0, ny).y;
+                        let pt = egui::pos2(left_x, y);
+                        if label_bounds.contains(pt) { Some(pt) } else { None }
+                    } else {
+                        [
+                            self.camera.center_lon - 48.0,
+                            self.camera.center_lon + 48.0,
+                            self.camera.center_lon,
+                            0.0,
+                            -60.0,
+                            60.0,
+                        ]
+                        .into_iter()
+                        .find_map(|lon_try| {
+                            project_latlon_to_ndc(
+                                self.projection,
+                                &self.camera,
+                                lat_g as f64,
+                                lon_try,
+                                0.0,
+                                aspect,
+                            )
+                            .map(|(nx, ny)| ndc_to_screen(nx, ny))
+                            .filter(|pt| label_bounds.contains(*pt))
+                        })
+                    };
+                    if let Some(pt) = candidate_pt {
+                        if !placed_grat_labels.iter().any(|p| p.distance(pt) < 34.0) {
+                            placed_grat_labels.push(pt);
+                            painter.text(
+                                pt + egui::vec2(2.0, -2.0),
+                                Align2::LEFT_BOTTOM,
+                                format_graticule_lat(lat_g),
+                                FontId::monospace(9.0),
+                                grat_label_col,
+                            );
                         }
                     }
                 }
@@ -1628,9 +1993,58 @@ impl TerraTwinGuiApp {
                             prev = None;
                         }
                     }
+
+                    let cand_lats: &[f64] = match self.projection {
+                        MapProjectionKind::ArcticPolarStereo => &[60.0, 30.0],
+                        MapProjectionKind::AntarcticPolarStereo => &[-60.0, -30.0],
+                        MapProjectionKind::Equirectangular2d => &[self.camera.center_lat.clamp(-60.0, 60.0), 0.0],
+                        MapProjectionKind::Globe3dWgs84 => &[0.0, 30.0, -30.0, 60.0, -60.0],
+                    };
+                    let candidate_pt = if self.projection == MapProjectionKind::Equirectangular2d {
+                        let (_, scale_y) = equirectangular_scales(aspect);
+                        let bot_ny = (((-90.0 - self.camera.center_lat) / 90.0)
+                            * self.camera.zoom
+                            * scale_y) as f32;
+                        let bot_y = ndc_to_screen(0.0, bot_ny).y.min(rect.bottom() - 42.0) - 4.0;
+                        project_latlon_to_ndc(
+                            self.projection,
+                            &self.camera,
+                            cand_lats[0],
+                            lon_g as f64,
+                            0.0,
+                            aspect,
+                        )
+                        .map(|(nx, _)| egui::pos2(ndc_to_screen(nx, 0.0).x, bot_y))
+                        .filter(|pt| label_bounds.contains(*pt))
+                    } else {
+                        cand_lats.iter().find_map(|&lat_try| {
+                            project_latlon_to_ndc(
+                                self.projection,
+                                &self.camera,
+                                lat_try,
+                                lon_g as f64,
+                                0.0,
+                                aspect,
+                            )
+                            .map(|(nx, ny)| ndc_to_screen(nx, ny))
+                            .filter(|pt| label_bounds.contains(*pt))
+                        })
+                    };
+                    if let Some(pt) = candidate_pt {
+                        if !placed_grat_labels.iter().any(|p| p.distance(pt) < 38.0) {
+                            placed_grat_labels.push(pt);
+                            painter.text(
+                                pt + egui::vec2(2.0, -2.0),
+                                Align2::LEFT_BOTTOM,
+                                format_graticule_lon(lon_g),
+                                FontId::monospace(9.0),
+                                grat_label_col,
+                            );
+                        }
+                    }
                 }
 
-                // Marching-Squares 4 hPa MSLP Isobars (thin translucent cyan-slate below coastlines) & Thermal Fronts
+                // Marching-Squares 4 hPa MSLP Isobars + hPa Labels & WMO Cold/Warm Front Pips
                 if self
                     .layer_states
                     .get("synoptic_fronts_isobars")
@@ -1641,6 +2055,24 @@ impl TerraTwinGuiApp {
                         Stroke::new(0.85_f32, Color32::from_rgba_unmultiplied(125, 205, 240, 112));
                     let iso_major =
                         Stroke::new(1.15_f32, Color32::from_rgba_unmultiplied(168, 228, 255, 160));
+                    let extrema_pts: Vec<Pos2> = self
+                        .cached_extrema
+                        .iter()
+                        .filter_map(|ext| {
+                            project_latlon_to_ndc(
+                                self.projection,
+                                &self.camera,
+                                ext.lat,
+                                ext.lon,
+                                0.0,
+                                aspect,
+                            )
+                            .map(|(nx, ny)| ndc_to_screen(nx, ny))
+                        })
+                        .collect();
+                    let mut placed_iso_labels: Vec<(Pos2, f32)> = Vec::new();
+                    let iso_label_bounds = rect.shrink(30.0);
+
                     for seg in &self.cached_isobars {
                         if let (Some((nx1, ny1)), Some((nx2, ny2))) = (
                             project_latlon_to_ndc(
@@ -1662,13 +2094,45 @@ impl TerraTwinGuiApp {
                         ) {
                             let p1 = ndc_to_screen(nx1, ny1);
                             let p2 = ndc_to_screen(nx2, ny2);
-                            if p1.distance(p2) < rect.width() * 0.25 {
+                            let seg_len = p1.distance(p2);
+                            if seg_len < rect.width() * 0.25 {
                                 let is_major = ((seg.level - 1012.0).abs() < 0.5)
                                     || ((seg.level - 1000.0).abs() < 0.5);
                                 painter.line_segment(
                                     [p1, p2],
                                     if is_major { iso_major } else { iso_thin },
                                 );
+                                if seg_len >= 3.0 {
+                                    let mid = egui::pos2(0.5 * (p1.x + p2.x), 0.5 * (p1.y + p2.y));
+                                    let clear_of_extrema =
+                                        !extrema_pts.iter().any(|ep| ep.distance(mid) < 30.0);
+                                    let clear_same_level = !placed_iso_labels.iter().any(|(lp, lv)| {
+                                        (*lv - seg.level).abs() < 0.5 && lp.distance(mid) < 160.0
+                                    });
+                                    let clear_any = !placed_iso_labels.iter().any(|(lp, _)| {
+                                        (lp.x - mid.x).abs() < 48.0 && (lp.y - mid.y).abs() < 18.0
+                                    });
+                                    if iso_label_bounds.contains(mid)
+                                        && clear_of_extrema
+                                        && clear_same_level
+                                        && clear_any
+                                    {
+                                        placed_iso_labels.push((mid, seg.level));
+                                        let bg = Rect::from_center_size(mid, egui::vec2(44.0, 12.0));
+                                        painter.rect_filled(
+                                            bg,
+                                            2.0,
+                                            Color32::from_rgba_unmultiplied(10, 18, 30, 175),
+                                        );
+                                        painter.text(
+                                            mid,
+                                            Align2::CENTER_CENTER,
+                                            format!("{:.0} hPa", seg.level),
+                                            FontId::monospace(8.5),
+                                            Color32::from_rgba_unmultiplied(178, 232, 255, 225),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1677,6 +2141,8 @@ impl TerraTwinGuiApp {
                         Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(70, 175, 255, 215));
                     let warm_stroke =
                         Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(255, 90, 75, 215));
+                    let mut cold_pips: Vec<Pos2> = Vec::new();
+                    let mut warm_pips: Vec<Pos2> = Vec::new();
                     for fseg in &self.cached_fronts {
                         if let (Some((nx1, ny1)), Some((nx2, ny2))) = (
                             project_latlon_to_ndc(
@@ -1698,7 +2164,8 @@ impl TerraTwinGuiApp {
                         ) {
                             let p1 = ndc_to_screen(nx1, ny1);
                             let p2 = ndc_to_screen(nx2, ny2);
-                            if p1.distance(p2) < rect.width() * 0.2 {
+                            let seg_len = p1.distance(p2);
+                            if seg_len < rect.width() * 0.2 {
                                 painter.line_segment(
                                     [p1, p2],
                                     if fseg.is_cold_front {
@@ -1707,6 +2174,16 @@ impl TerraTwinGuiApp {
                                         warm_stroke
                                     },
                                 );
+                                let mid = egui::pos2(0.5 * (p1.x + p2.x), 0.5 * (p1.y + p2.y));
+                                let pip_list = if fseg.is_cold_front {
+                                    &mut cold_pips
+                                } else {
+                                    &mut warm_pips
+                                };
+                                if seg_len >= 3.5 && !pip_list.iter().any(|p| p.distance(mid) < 14.0) {
+                                    pip_list.push(mid);
+                                    draw_wmo_front_pip(&painter, p1, p2, fseg.is_cold_front);
+                                }
                             }
                         }
                     }
@@ -2037,7 +2514,7 @@ impl TerraTwinGuiApp {
                     self.anomaly_mode,
                 );
 
-                // Hover HUD Tooltip
+                // Hover HUD Tooltip with Cursor-Sampled Active Scalar Readout
                 if let Some(hover_pos) = response.hover_pos() {
                     let ndc_x = 2.0 * ((hover_pos.x - rect.left()) / rect.width()) as f64 - 1.0;
                     let ndc_y = 1.0 - 2.0 * ((hover_pos.y - rect.top()) / rect.height()) as f64;
@@ -2048,25 +2525,70 @@ impl TerraTwinGuiApp {
                         ndc_y,
                         aspect,
                     ) {
+                        let elev = synthetic_planetary_elevation_m(hlat, hlon);
+                        let scalar_suffix = self
+                            .cached_snapshot
+                            .as_ref()
+                            .and_then(|snap| {
+                                sample_active_scalar_at(
+                                    self.workers.coordinator.schema(),
+                                    snap,
+                                    &self.layer_states,
+                                    hlat,
+                                    hlon,
+                                    self.anomaly_mode,
+                                )
+                            })
+                            .map(|(name, val, units)| {
+                                if self.anomaly_mode {
+                                    if units.is_empty() {
+                                        format!(" | {}: {:+.2} (anom)", truncate_ui_label(&name, 20), val)
+                                    } else {
+                                        format!(
+                                            " | {}: {:+.2} {} (anom)",
+                                            truncate_ui_label(&name, 18),
+                                            val,
+                                            truncate_ui_label(&units, 8)
+                                        )
+                                    }
+                                } else if units.is_empty() {
+                                    format!(" | {}: {:.2}", truncate_ui_label(&name, 22), val)
+                                } else {
+                                    format!(
+                                        " | {}: {:.2} {}",
+                                        truncate_ui_label(&name, 20),
+                                        val,
+                                        truncate_ui_label(&units, 10)
+                                    )
+                                }
+                            })
+                            .unwrap_or_default();
+                        let hud_text = format!(
+                            "Cursor: {:+.2}°, {:+.2}° | Elev: {:+.0} m{}",
+                            hlat, hlon, elev, scalar_suffix
+                        );
+                        let font_id = FontId::monospace(10.5);
+                        let galley = painter.layout_no_wrap(
+                            hud_text.clone(),
+                            font_id.clone(),
+                            Color32::from_rgb(210, 230, 250),
+                        );
+                        let max_hud_w = (rect.width() - 352.0).max(260.0);
+                        let hud_w = (galley.size().x + 16.0).min(max_hud_w);
                         let hud_rect = Rect::from_min_size(
                             egui::pos2(rect.left() + 12.0, rect.bottom() - 34.0),
-                            egui::vec2(310.0, 24.0),
+                            egui::vec2(hud_w, 24.0),
                         );
                         painter.rect_filled(
                             hud_rect,
                             4.0,
-                            Color32::from_rgba_unmultiplied(10, 16, 26, 210),
+                            Color32::from_rgba_unmultiplied(10, 16, 26, 215),
                         );
-                        painter.text(
+                        painter.with_clip_rect(hud_rect).text(
                             hud_rect.left_center() + egui::vec2(8.0, 0.0),
                             Align2::LEFT_CENTER,
-                            format!(
-                                "Cursor: {:+.2}°, {:+.2}° | Elev: {:+.0} m",
-                                hlat,
-                                hlon,
-                                synthetic_planetary_elevation_m(hlat, hlon)
-                            ),
-                            FontId::monospace(11.0),
+                            hud_text,
+                            font_id,
                             Color32::from_rgb(210, 230, 250),
                         );
                     }
@@ -2078,11 +2600,36 @@ impl TerraTwinGuiApp {
 impl TerraTwinGuiApp {
     pub fn ui_step(&mut self, ctx: &egui::Context) {
         let wants_kb = ctx.wants_keyboard_input();
-        let (f1_pressed, esc_pressed, space_pressed) = ctx.input(|i| {
+        let (
+            f1_pressed,
+            esc_pressed,
+            space_pressed,
+            r_pressed,
+            l_pressed,
+            a_pressed,
+            k1_pressed,
+            k2_pressed,
+            k3_pressed,
+            k4_pressed,
+            left_pressed,
+            right_pressed,
+            has_cmd_mod,
+        ) = ctx.input(|i| {
+            let cmd = i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command;
             (
                 i.key_pressed(egui::Key::F1),
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::R),
+                i.key_pressed(egui::Key::L),
+                i.key_pressed(egui::Key::A),
+                i.key_pressed(egui::Key::Num1),
+                i.key_pressed(egui::Key::Num2),
+                i.key_pressed(egui::Key::Num3),
+                i.key_pressed(egui::Key::Num4),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                cmd,
             )
         });
         if f1_pressed {
@@ -2094,10 +2641,45 @@ impl TerraTwinGuiApp {
             } else if self.transect_mode || !self.transect_points.is_empty() {
                 self.transect_mode = false;
                 self.transect_points.clear();
+            } else if !self.layer_filter_query.is_empty() {
+                self.layer_filter_query.clear();
             }
         }
-        if !wants_kb && space_pressed {
-            self.playing_timeline = !self.playing_timeline;
+        if !wants_kb && !has_cmd_mod {
+            if space_pressed {
+                self.playing_timeline = !self.playing_timeline;
+            }
+            if r_pressed {
+                self.reset_camera();
+            }
+            if l_pressed {
+                self.left_sidebar_open = !self.left_sidebar_open;
+            }
+            if a_pressed {
+                self.right_drawer_open = !self.right_drawer_open;
+            }
+            let new_proj = if k1_pressed {
+                Some(MapProjectionKind::Globe3dWgs84)
+            } else if k2_pressed {
+                Some(MapProjectionKind::Equirectangular2d)
+            } else if k3_pressed {
+                Some(MapProjectionKind::ArcticPolarStereo)
+            } else if k4_pressed {
+                Some(MapProjectionKind::AntarcticPolarStereo)
+            } else {
+                None
+            };
+            if let Some(p) = new_proj {
+                if self.projection != p {
+                    self.projection = p;
+                    self.raster_dirty = true;
+                }
+            }
+            if left_pressed {
+                self.step_timeline_by(-1);
+            } else if right_pressed {
+                self.step_timeline_by(1);
+            }
         }
 
         if self.last_timeline_refresh.elapsed() > std::time::Duration::from_secs(3) {
@@ -2181,8 +2763,14 @@ impl eframe::App for TerraTwinGuiApp {
     }
 }
 
-fn draw_readout_badge(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-    egui::Frame::none()
+fn draw_readout_badge(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    color: Color32,
+    tooltip: &str,
+) {
+    let ir = egui::Frame::none()
         .fill(Color32::from_rgb(22, 30, 46))
         .rounding(4.0)
         .inner_margin(egui::Margin::symmetric(7.0, 3.0))
@@ -2192,6 +2780,136 @@ fn draw_readout_badge(ui: &mut egui::Ui, label: &str, value: &str, color: Color3
                 ui.colored_label(color, egui::RichText::new(value).monospace().strong());
             });
         });
+    ui.interact(ir.response.rect, ui.id().with(label), Sense::hover())
+        .on_hover_text(tooltip);
+}
+
+#[inline]
+fn apply_globe_lambert_fresnel(rgb: [f32; 3], sx: f64, sy: f64) -> [u8; 3] {
+    let rho2 = (sx * sx + sy * sy).min(1.0);
+    let nz = (1.0 - rho2).max(0.0).sqrt() as f32;
+    let nx = sx as f32;
+    let ny = sy as f32;
+    // Upper-left solar key light direction normalized: (-0.42, 0.52, 0.744)
+    let mu_sun = (-0.42 * nx + 0.52 * ny + 0.744 * nz).clamp(0.0, 1.0);
+    let lambert = 0.60 + 0.44 * mu_sun;
+    // Eddington/Minnaert limb darkening at oblique grazing angles
+    let limb_dark = 0.76 + 0.24 * nz.powf(0.45);
+    // Fresnel Rayleigh atmospheric limb scatter near grazing angles
+    let fresnel = (1.0 - nz).powf(3.0);
+    let atm_scatter = 0.34 * fresnel;
+    let lit_r = rgb[0] * lambert * limb_dark;
+    let lit_g = rgb[1] * lambert * limb_dark;
+    let lit_b = rgb[2] * lambert * limb_dark;
+    [
+        (lit_r * (1.0 - atm_scatter) + 88.0 * atm_scatter).clamp(0.0, 255.0) as u8,
+        (lit_g * (1.0 - atm_scatter) + 185.0 * atm_scatter).clamp(0.0, 255.0) as u8,
+        (lit_b * (1.0 - atm_scatter) + 255.0 * atm_scatter).clamp(0.0, 255.0) as u8,
+    ]
+}
+
+#[inline]
+fn layer_matches_filter(
+    grp: &crate::schema::LayerGroupSpec,
+    lyr: &crate::schema::LayerSpec,
+    filter_lc: &str,
+) -> bool {
+    if filter_lc.is_empty() {
+        return true;
+    }
+    lyr.name.to_ascii_lowercase().contains(filter_lc)
+        || lyr.id.to_ascii_lowercase().contains(filter_lc)
+        || lyr.description.to_ascii_lowercase().contains(filter_lc)
+        || lyr.units.to_ascii_lowercase().contains(filter_lc)
+        || grp.group_name.to_ascii_lowercase().contains(filter_lc)
+        || lyr
+            .public_sources
+            .iter()
+            .any(|s| s.to_ascii_lowercase().contains(filter_lc))
+}
+
+#[inline]
+fn format_graticule_lat(lat: i32) -> String {
+    if lat > 0 {
+        format!("{}°N", lat)
+    } else if lat < 0 {
+        format!("{}°S", -lat)
+    } else {
+        "0°".to_string()
+    }
+}
+
+#[inline]
+fn format_graticule_lon(lon: i32) -> String {
+    if lon == 0 {
+        "0°".to_string()
+    } else if lon == -180 || lon == 180 {
+        "180°".to_string()
+    } else if lon > 0 {
+        format!("{}°E", lon)
+    } else {
+        format!("{}°W", -lon)
+    }
+}
+
+/// Render WMO cold front triangular pips (pointing toward warm air) or warm front semicircular
+/// pips (bulging toward cold air) along segment `p1 -> p2`.
+fn draw_wmo_front_pip(painter: &egui::Painter, p1: Pos2, p2: Pos2, is_cold_front: bool) {
+    let d = p2 - p1;
+    let len = d.length();
+    if len < 1.0e-3 {
+        return;
+    }
+    let t = d / len;
+    let mid = egui::pos2(0.5 * (p1.x + p2.x), 0.5 * (p1.y + p2.y));
+    // Screen-space warm-side normal (+grad_S(T)) given tangent (-dtdy, dtdx) and y-down screen coords
+    let n_warm = egui::vec2(-t.y, t.x);
+    if is_cold_front {
+        let col = Color32::from_rgba_unmultiplied(70, 175, 255, 225);
+        let pts = vec![mid - t * 3.6, mid + n_warm * 6.5, mid + t * 3.6];
+        painter.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+    } else {
+        let col = Color32::from_rgba_unmultiplied(255, 90, 75, 225);
+        let n_cold = -n_warm;
+        let r = 4.2_f32;
+        let mut pts = Vec::with_capacity(7);
+        for k in 0..=6 {
+            let theta = std::f32::consts::PI * (k as f32 / 6.0);
+            pts.push(mid + (-t * theta.cos() + n_cold * theta.sin()) * r);
+        }
+        painter.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+    }
+}
+
+fn sample_active_scalar_at(
+    schema: &HubSchema,
+    snap: &TelemetrySnapshot,
+    layer_states: &HashMap<String, LayerUiState>,
+    lat: f64,
+    lon: f64,
+    anomaly_mode: bool,
+) -> Option<(String, f32, String)> {
+    for (_, lyr) in schema.all_layers().into_iter().rev() {
+        if lyr.id == "synoptic_fronts_isobars" || lyr.id == "teleconnection_oscillation_masks" {
+            continue;
+        }
+        let vis = layer_states.get(&lyr.id).map(|s| s.visible).unwrap_or(false);
+        if !vis {
+            continue;
+        }
+        if let Some(grid) = snap.grids.get(&lyr.id) {
+            let raw = sample_grid_bilinear(&grid.values, grid.width, grid.height, lat, lon);
+            if raw.is_finite() {
+                let val = if anomaly_mode {
+                    raw - grid.mean_val
+                } else {
+                    raw
+                };
+                return Some((lyr.name.clone(), val, lyr.units.clone()));
+            }
+        }
+    }
+    None
 }
 
 fn draw_sounding_canvas(ui: &mut egui::Ui, sounding: &[(f64, f64, f64, f64)]) {
@@ -2765,8 +3483,8 @@ fn draw_viewport_colorbars(
     let total_vis = visible_scalar.len();
     let shown = &visible_scalar[..total_vis.min(2)];
 
-    let card_w = 296.0_f32;
-    let card_h = 46.0_f32;
+    let card_w = 320.0_f32;
+    let card_h = 48.0_f32;
     let gap = 6.0_f32;
     let extra_pill_h = if total_vis > 2 { 18.0_f32 } else { 0.0_f32 };
     let mut cur_bottom = rect.bottom() - 10.0;
@@ -2814,14 +3532,13 @@ fn draw_viewport_colorbars(
             (st.palette, st.min_range, st.max_range, "")
         };
         let span = (hi - lo).abs().max(1e-6);
-        let mid = 0.5 * (lo + hi);
 
         let title_raw = if lyr.units.is_empty() {
             format!("{}{}", lyr.name, suffix)
         } else {
             format!("{} [{}]{}", lyr.name, lyr.units, suffix)
         };
-        let title = truncate_ui_label(&title_raw, 46);
+        let title = truncate_ui_label(&title_raw, 48);
         let card_painter = painter.with_clip_rect(card_rect);
         card_painter.text(
             egui::pos2(card_rect.left() + 8.0, card_rect.top() + 4.0),
@@ -2831,8 +3548,8 @@ fn draw_viewport_colorbars(
             Color32::from_rgb(225, 238, 252),
         );
 
-        let bar_left = card_rect.left() + 10.0;
-        let bar_right = card_rect.right() - 10.0;
+        let bar_left = card_rect.left() + 12.0;
+        let bar_right = card_rect.right() - 12.0;
         let bar_top = card_rect.top() + 19.0;
         let bar_bot = bar_top + 10.0;
         let steps = 64usize;
@@ -2852,35 +3569,47 @@ fn draw_viewport_colorbars(
         );
         painter.rect_stroke(bar_rect, 0.0, Stroke::new(0.8_f32, Color32::from_rgb(90, 115, 145)));
 
-        for frac in [0.0_f32, 0.5, 1.0] {
+        // 5-tick colorbar scale with explicit highlighted 0 marker in anomaly mode
+        for idx in 0..5usize {
+            let frac = idx as f32 * 0.25;
             let tx = bar_left + frac * (bar_right - bar_left);
-            painter.line_segment(
-                [egui::pos2(tx, bar_bot), egui::pos2(tx, bar_bot + 2.5)],
-                Stroke::new(0.9_f32, Color32::from_rgb(175, 195, 220)),
+            let val = lo + frac * (hi - lo);
+            let is_zero_anom = anomaly_mode && idx == 2;
+            let is_near_zero = is_zero_anom || val.abs() < 1.0e-4 * span;
+            if is_zero_anom {
+                painter.line_segment(
+                    [egui::pos2(tx, bar_top - 1.5), egui::pos2(tx, bar_bot + 3.5)],
+                    Stroke::new(1.4_f32, Color32::WHITE),
+                );
+            } else {
+                painter.line_segment(
+                    [egui::pos2(tx, bar_bot), egui::pos2(tx, bar_bot + 2.5)],
+                    Stroke::new(0.9_f32, Color32::from_rgb(175, 195, 220)),
+                );
+            }
+            let tick_lbl = if is_near_zero {
+                "0".to_string()
+            } else {
+                format_colorbar_tick(val, span)
+            };
+            let align = match idx {
+                0 => Align2::LEFT_TOP,
+                4 => Align2::RIGHT_TOP,
+                _ => Align2::CENTER_TOP,
+            };
+            let lbl_col = if is_zero_anom {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(190, 210, 232)
+            };
+            painter.text(
+                egui::pos2(tx, bar_bot + 3.5),
+                align,
+                tick_lbl,
+                FontId::monospace(8.5),
+                lbl_col,
             );
         }
-
-        painter.text(
-            egui::pos2(bar_left, bar_bot + 3.0),
-            Align2::LEFT_TOP,
-            format_colorbar_tick(lo, span),
-            FontId::monospace(9.0),
-            Color32::from_rgb(190, 210, 232),
-        );
-        painter.text(
-            egui::pos2(0.5 * (bar_left + bar_right), bar_bot + 3.0),
-            Align2::CENTER_TOP,
-            format_colorbar_tick(mid, span),
-            FontId::monospace(9.0),
-            Color32::from_rgb(190, 210, 232),
-        );
-        painter.text(
-            egui::pos2(bar_right, bar_bot + 3.0),
-            Align2::RIGHT_TOP,
-            format_colorbar_tick(hi, span),
-            FontId::monospace(9.0),
-            Color32::from_rgb(190, 210, 232),
-        );
 
         cur_bottom -= card_h + gap;
     }
@@ -3307,6 +4036,215 @@ mod tests {
         run_key_step(&mut app, &ctx, egui::Key::Escape);
         assert!(!app.transect_mode);
         assert!(app.transect_points.is_empty());
+
+        // Projections 1..=4
+        run_key_step(&mut app, &ctx, egui::Key::Num2);
+        assert_eq!(app.projection, MapProjectionKind::Equirectangular2d);
+        run_key_step(&mut app, &ctx, egui::Key::Num3);
+        assert_eq!(app.projection, MapProjectionKind::ArcticPolarStereo);
+        run_key_step(&mut app, &ctx, egui::Key::Num4);
+        assert_eq!(app.projection, MapProjectionKind::AntarcticPolarStereo);
+        run_key_step(&mut app, &ctx, egui::Key::Num1);
+        assert_eq!(app.projection, MapProjectionKind::Globe3dWgs84);
+
+        // L & A drawer toggles
+        let left_init = app.left_sidebar_open;
+        let right_init = app.right_drawer_open;
+        run_key_step(&mut app, &ctx, egui::Key::L);
+        assert_eq!(app.left_sidebar_open, !left_init);
+        run_key_step(&mut app, &ctx, egui::Key::A);
+        assert_eq!(app.right_drawer_open, !right_init);
+        run_key_step(&mut app, &ctx, egui::Key::L);
+        run_key_step(&mut app, &ctx, egui::Key::A);
+
+        // R resets camera center, zoom, and bearing
+        app.camera.center_lat = 48.0;
+        app.camera.center_lon = 120.0;
+        app.camera.zoom = 3.5;
+        app.camera.bearing_deg = 55.0;
+        run_key_step(&mut app, &ctx, egui::Key::R);
+        assert!((app.camera.zoom - 1.0).abs() < 1e-9);
+        assert!((app.camera.bearing_deg - 0.0).abs() < 1e-9);
+        assert!((app.camera.center_lat - 20.0).abs() < 1e-6);
+
+        // ArrowLeft / ArrowRight step simulation year in projection mode
+        app.temporal_mode_id = "cmip_projections".to_string();
+        app.sim_cfg.sim_year = 2050.0;
+        run_key_step(&mut app, &ctx, egui::Key::ArrowRight);
+        assert!((app.sim_cfg.sim_year - 2051.0).abs() < 1e-6);
+        run_key_step(&mut app, &ctx, egui::Key::ArrowLeft);
+        assert!((app.sim_cfg.sim_year - 2050.0).abs() < 1e-6);
+
+        // Presets configure scenario, year, and layers cleanly
+        app.apply_quick_preset(QuickScenarioPreset::HighEmissionsSsp585);
+        assert_eq!(app.sim_cfg.scenario, SspScenario::Ssp5_85);
+        assert!((app.sim_cfg.sim_year - 2100.0).abs() < 1e-6);
+        assert!(app.layer_states["coastal_inundation_storm_surge"].visible);
+        app.apply_quick_preset(QuickScenarioPreset::ModerateSsp245);
+        assert_eq!(app.sim_cfg.scenario, SspScenario::Ssp2_45);
+        assert!((app.sim_cfg.sim_year - 2050.0).abs() < 1e-6);
+        app.apply_quick_preset(QuickScenarioPreset::BaselinePresent);
+        assert_eq!(app.temporal_mode_id, "realtime_telemetry");
+
+        drop(app);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn shortcuts_suppressed_when_text_input_focused_and_fidelity_helpers() {
+        let db_path = std::env::temp_dir().join(format!(
+            "terratwin_gui_focus_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let schema = HubSchema::load(None).expect("embedded schema");
+        let db = ClimateDatabase::open(&db_path).expect("temp db");
+        let coord = BackgroundCoordinator::new(schema.clone(), db, SimulationConfig::default());
+        let workers = RunningWorkers::without_threads(coord);
+        let mut app = TerraTwinGuiApp::new_headless(workers);
+        let ctx = egui::Context::default();
+
+        // Render frame 0, focus layer search TextEdit, then verify ui_step ignores shortcuts while focused
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |c| {
+                app.ui_step(c);
+                c.memory_mut(|m| m.request_focus(egui::Id::new("terratwin_layer_filter")));
+            },
+        );
+        app.camera.zoom = 2.5;
+        app.temporal_mode_id = "cmip_projections".to_string();
+        app.sim_cfg.sim_year = 2050.0;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::R,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::Num2,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::L,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::ArrowRight,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |c| {
+                assert!(c.wants_keyboard_input());
+                app.ui_step(c);
+            },
+        );
+        assert!((app.camera.zoom - 2.5).abs() < 1e-9);
+        assert_eq!(app.projection, MapProjectionKind::Globe3dWgs84);
+        assert!(app.left_sidebar_open);
+        assert!((app.sim_cfg.sim_year - 2050.0).abs() < 1e-9);
+
+        // Layer filter matching across all 34 layers
+        let matched: usize = schema
+            .layer_groups
+            .iter()
+            .flat_map(|g| g.layers.iter().map(move |l| (g, l)))
+            .filter(|(g, l)| layer_matches_filter(g, l, "methane"))
+            .count();
+        assert_eq!(matched, 1);
+
+        // Graticule formatting
+        assert_eq!(format_graticule_lat(60), "60°N");
+        assert_eq!(format_graticule_lat(-30), "30°S");
+        assert_eq!(format_graticule_lat(0), "0°");
+        assert_eq!(format_graticule_lon(60), "60°E");
+        assert_eq!(format_graticule_lon(-120), "120°W");
+        assert_eq!(format_graticule_lon(0), "0°");
+
+        // Lambertian globe shading is brighter on subsolar side (-0.42, 0.52) than dark limb (0.85, -0.45)
+        let subsolar = apply_globe_lambert_fresnel([160.0, 160.0, 160.0], -0.42, 0.52);
+        let dark_limb = apply_globe_lambert_fresnel([160.0, 160.0, 160.0], 0.80, -0.45);
+        assert!(subsolar[0] > dark_limb[0] + 20);
+
+        // Cursor-sampled active scalar readout
+        let w = 12usize;
+        let h = 6usize;
+        let mut grids = HashMap::new();
+        grids.insert(
+            "cmip6_downscaled_ensemble".to_string(),
+            crate::db::StoredGridRecord {
+                layer_id: "cmip6_downscaled_ensemble".to_string(),
+                scenario: "SSP2-4.5".to_string(),
+                timestamp_utc: "2050-01-01T00:00:00Z".to_string(),
+                vertical_level: 850.0,
+                width: w,
+                height: h,
+                min_val: 2.0,
+                max_val: 4.0,
+                mean_val: 3.0,
+                values: vec![3.5_f32; w * h],
+                u_component: None,
+                v_component: None,
+            },
+        );
+        let snap = TelemetrySnapshot {
+            config: app.sim_cfg.clone(),
+            readouts: crate::db::GlobalLiveReadouts {
+                timestamp_utc: "2050-01-01T00:00:00Z".to_string(),
+                scenario: "SSP2-4.5".to_string(),
+                global_2m_temp_anomaly_c: 2.0,
+                mauna_loa_co2_ppm: 500.0,
+                enso_nino34_c: 0.0,
+                global_sst_anomaly_c: 1.5,
+            },
+            grids,
+            db_stats: crate::db::DbStatsSummary {
+                db_path: String::new(),
+                registered_layers: 34,
+                raw_observation_count: 0,
+                simulated_grid_count: 1,
+                readout_snapshots: 1,
+                sync_events: 0,
+                latest_simulation_utc: None,
+            },
+            last_step_ms: 10,
+            last_ingest_status: String::new(),
+        };
+        app.apply_quick_preset(QuickScenarioPreset::ModerateSsp245);
+        let (name, val, _) =
+            sample_active_scalar_at(&schema, &snap, &app.layer_states, 10.0, -20.0, false).unwrap();
+        assert!(name.contains("CMIP"));
+        assert!((val - 3.5).abs() < 1e-4);
+        let (_, anom_val, _) =
+            sample_active_scalar_at(&schema, &snap, &app.layer_states, 10.0, -20.0, true).unwrap();
+        assert!((anom_val - 0.5).abs() < 1e-4);
 
         drop(app);
         let _ = std::fs::remove_file(&db_path);

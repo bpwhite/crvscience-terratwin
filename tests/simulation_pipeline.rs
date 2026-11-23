@@ -32,18 +32,21 @@ use terratwin_climate_hub::{
         assimilate_3dvar_cg, barnes_assimilate_grid, detect_mslp_extrema, detect_thermal_fronts,
         extract_marching_squares_contours, haversine_km, project_latlon_to_ndc,
         sample_grid_bicubic_monotone, spherical_area_weighted_mean, unproject_ndc_to_latlon,
-        CameraState, GeoSamplePoint, MapProjectionKind, ObsSamplePoint, ThreeDVarConfig,
+        zoom_camera_toward_ndc, CameraState, GeoSamplePoint, MapProjectionKind, ObsSamplePoint,
+        ThreeDVarConfig,
     },
     physics::{
         bolton_equivalent_potential_temp_k, bolton_saturation_vapor_pressure_hpa,
-        compute_surface_wind_stress, compute_wind_stress_curl,
-        co2_radiative_forcing_wm2, compute_outdoor_wbgt,
-        compute_two_layer_qgpv_from_streamfunctions, diagnose_rotational_wind_from_streamfunction,
+        co2_radiative_forcing_wm2, compute_outdoor_wbgt, compute_surface_wind_stress,
+        compute_two_layer_qgpv_from_streamfunctions, compute_wind_stress_curl,
+        diagnose_rotational_wind_from_streamfunction, eos80_seawater_density,
+        eos80_seawater_density_at_pressure_dbar, equilibrium_global_warming_c,
         invert_two_layer_qgpv_streamfunctions, planetary_coriolis_f, semi_lagrangian_advect_qmsl,
         solve_seawater_carbonate_chemistry, solve_spherical_linear_balance_mslp,
         solve_stommel_munk_gyre, spherical_diffusive_heat_step,
         step_ocean_reduced_gravity_and_gyre, step_semtner_sea_ice_thickness, step_two_layer_qgpv,
-        step_van_wagner_fwi, stull_wet_bulb_celsius, synthetic_planetary_elevation_m,
+        step_van_wagner_fwi, step_van_wagner_fwi_at_location, stull_wet_bulb_celsius,
+        synthetic_planetary_elevation_m, transient_global_warming_c, van_wagner_daylength_factors,
         ClimateSimulationEngine, SimulationConfig,
     },
     schema::{HubSchema, SspScenario},
@@ -144,7 +147,15 @@ fn verifies_coupled_climate_ocean_cryosphere_and_fwi_physics() {
     );
 
     let df_2x = co2_radiative_forcing_wm2(556.0);
-    assert!((df_2x - 3.708).abs() < 0.05);
+    assert!(
+        (df_2x - 3.93).abs() < 0.05,
+        "IPCC AR6 / Etminan 2016 2xCO2 forcing must be ~3.93 W/m^2, got {df_2x}"
+    );
+    let ecs_2x = equilibrium_global_warming_c(556.0);
+    let tcr_2x = transient_global_warming_c(556.0);
+    assert!((ecs_2x - 3.0).abs() < 0.02);
+    assert!((tcr_2x - 2.16).abs() < 0.02);
+    assert!(ecs_2x > tcr_2x);
 
     let preind_carb = solve_seawater_carbonate_chemistry(18.0, 35.0, 280.0, 0.0);
     let high_co2_carb = solve_seawater_carbonate_chemistry(18.0, 35.0, 800.0, 0.0);
@@ -936,4 +947,190 @@ fn sqlite_retention_policy_prunes_old_ticks_and_preserves_latest() {
     assert_eq!(kept, all_ts[3..5].to_vec());
 
     let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[test]
+fn bolton_thermodynamics_extreme_inputs_remain_finite() {
+    for t_c in [
+        -243.5_f64,
+        -243.500_001,
+        -273.15,
+        -500.0,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NAN,
+        120.0,
+    ] {
+        let es = bolton_saturation_vapor_pressure_hpa(t_c);
+        assert!(
+            es.is_finite() && es >= 0.0,
+            "bolton_saturation_vapor_pressure_hpa({t_c}) produced non-finite/negative {es}"
+        );
+    }
+
+    let extreme_cases = [
+        (-243.5_f64, 0.0, 1013.25),
+        (-273.15, 0.0, 1000.0),
+        (-300.0, -0.05, 500.0),
+        (30.0, 0.0, 1000.0),
+        (25.0, 0.04, 0.0),
+        (25.0, 0.04, -50.0),
+        (-90.0, 0.05, 1.0e8),
+        (55.0, 1.5, 1013.25),
+        (f64::NAN, f64::NAN, f64::NAN),
+        (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+        (f64::INFINITY, f64::INFINITY, f64::INFINITY),
+    ];
+    for (t_c, q, p_hpa) in extreme_cases {
+        let theta_e = bolton_equivalent_potential_temp_k(t_c, q, p_hpa);
+        assert!(
+            theta_e.is_finite() && theta_e > 100.0 && theta_e < 2000.0,
+            "bolton_equivalent_potential_temp_k({t_c}, {q}, {p_hpa}) produced invalid {theta_e}"
+        );
+    }
+
+    assert!(stull_wet_bulb_celsius(20.0, 0.0).is_finite());
+    assert!(stull_wet_bulb_celsius(20.0, -10.0).is_finite());
+    assert!(stull_wet_bulb_celsius(f64::NAN, f64::NAN).is_finite());
+}
+
+#[test]
+fn eos80_seawater_density_unesco_check_values_and_compression() {
+    // UNESCO EOS-80 1-atm check value: S=35 PSU, T=25 °C, P=0 -> 1023.343 kg/m^3
+    let rho_check_0 = eos80_seawater_density(25.0, 35.0, 0.0);
+    assert!(
+        (rho_check_0 - 1023.343).abs() < 0.05,
+        "UNESCO EOS-80 (S=35, T=25, P=0) expected 1023.343 ± 0.05, got {rho_check_0:.5}"
+    );
+    assert!((rho_check_0 - 1023.343_06).abs() < 1.0e-3);
+
+    // Pure SMOW check value: S=0 PSU, T=5 °C, P=0 -> 999.96675 kg/m^3
+    let rho_smow = eos80_seawater_density(5.0, 0.0, 0.0);
+    assert!(
+        (rho_smow - 999.966_75).abs() < 0.01,
+        "UNESCO SMOW (S=0, T=5, P=0) expected 999.96675, got {rho_smow:.5}"
+    );
+
+    // UNESCO EOS-80 high-pressure check value: S=35 PSU, T=25 °C, P=10000 dbar (1000 bar) -> 1062.53817 kg/m^3
+    let rho_10k_dbar = eos80_seawater_density_at_pressure_dbar(25.0, 35.0, 10_000.0);
+    assert!(
+        (rho_10k_dbar - 1062.538).abs() < 0.05,
+        "UNESCO EOS-80 (S=35, T=25, P=10000 dbar) expected 1062.538 ± 0.05, got {rho_10k_dbar:.5}"
+    );
+
+    // Nonlinear secant bulk modulus compression with depth (4000 m vs surface at T=2°C, S=34.7 PSU)
+    let rho_surf = eos80_seawater_density(2.0, 34.7, 0.0);
+    let rho_2000 = eos80_seawater_density(2.0, 34.7, 2000.0);
+    let rho_4000 = eos80_seawater_density(2.0, 34.7, 4000.0);
+    assert!(rho_4000 > rho_2000 && rho_2000 > rho_surf);
+    assert!(
+        rho_4000 - rho_surf > 17.0 && rho_4000 - rho_surf < 21.0,
+        "Expected ~18.5 kg/m^3 abyssal compression at 4000m, got {}",
+        rho_4000 - rho_surf
+    );
+    // Bulk modulus stiffening makes second 2000 m increment slightly smaller than first 2000 m
+    assert!((rho_4000 - rho_2000) < (rho_2000 - rho_surf));
+}
+
+#[test]
+fn carbonate_chemistry_kw_convergence_across_ph_7_3_to_8_4() {
+    let co2_levels = [120.0_f64, 180.0, 280.0, 420.0, 600.0, 900.0, 1400.0, 2200.0];
+    let mut prev_ph = f64::INFINITY;
+    let mut prev_omega = f64::INFINITY;
+
+    for &pco2 in &co2_levels {
+        let st = solve_seawater_carbonate_chemistry(18.0, 35.0, pco2, 0.0);
+        assert!(st.ph_total.is_finite() && st.omega_aragonite.is_finite());
+        assert!(
+            (7.2..=8.55).contains(&st.ph_total),
+            "pCO2={pco2} yielded out-of-range pH {}",
+            st.ph_total
+        );
+        assert!(
+            st.ph_total < prev_ph && st.omega_aragonite < prev_omega,
+            "Monotonic acidification violated at pCO2={pco2}: pH {} vs {prev_ph}",
+            st.ph_total
+        );
+        prev_ph = st.ph_total;
+        prev_omega = st.omega_aragonite;
+    }
+
+    // Confirm full 7.3..=8.4 envelope is spanned smoothly across cold/warm/deep regimes
+    let high_alk_low_co2 = solve_seawater_carbonate_chemistry(5.0, 35.0, 140.0, 0.0);
+    let deep_acidic = solve_seawater_carbonate_chemistry(2.0, 34.5, 1900.0, 2000.0);
+    assert!(high_alk_low_co2.ph_total > 8.35);
+    assert!(deep_acidic.ph_total < 7.45 && deep_acidic.ph_total > 7.10);
+}
+
+#[test]
+fn van_wagner_fwi_daylength_tables_seasonal_and_hemispheric() {
+    let (le_nh_jul, lf_nh_jul) = van_wagner_daylength_factors(45.0, 7);
+    let (le_nh_jan, lf_nh_jan) = van_wagner_daylength_factors(45.0, 1);
+    assert!(le_nh_jul > le_nh_jan && lf_nh_jul > lf_nh_jan);
+
+    // Southern hemisphere January matches Northern hemisphere July
+    let (le_sh_jan, lf_sh_jan) = van_wagner_daylength_factors(-45.0, 1);
+    assert!((le_sh_jan - le_nh_jul).abs() < 1e-9);
+    assert!((lf_sh_jan - lf_nh_jul).abs() < 1e-9);
+
+    // Equatorial band uses constant (Le=9.0, Lf=1.4)
+    for m in 1..=12 {
+        assert_eq!(van_wagner_daylength_factors(0.0, m), (9.0, 1.4));
+    }
+
+    let summer = step_van_wagner_fwi_at_location(30.0, 22.0, 6.0, 0.0, 88.0, 45.0, 280.0, 45.0, 7);
+    let winter = step_van_wagner_fwi_at_location(30.0, 22.0, 6.0, 0.0, 88.0, 45.0, 280.0, 45.0, 1);
+    assert!(summer.dmc > winter.dmc);
+    assert!(summer.dc > winter.dc);
+    assert!(summer.fwi > winter.fwi);
+}
+
+#[test]
+fn cursor_centered_zoom_and_polar_bearing_roundtrip() {
+    for &proj in &[
+        MapProjectionKind::Equirectangular2d,
+        MapProjectionKind::Globe3dWgs84,
+    ] {
+        let mut cam = CameraState {
+            center_lon: -20.0,
+            center_lat: 20.0,
+            zoom: 1.4,
+            pitch_deg: 0.0,
+            bearing_deg: if proj == MapProjectionKind::Globe3dWgs84 {
+                32.0
+            } else {
+                0.0
+            },
+            vertical_exaggeration: 15.0,
+        };
+        let cursor_ndc = (0.32_f64, -0.22_f64);
+        let aspect = 1.6_f64;
+        let (lat_before, lon_before) =
+            unproject_ndc_to_latlon(proj, &cam, cursor_ndc.0, cursor_ndc.1, aspect).unwrap();
+        zoom_camera_toward_ndc(proj, &mut cam, 1.22, Some(cursor_ndc), aspect);
+        let (lat_after, lon_after) =
+            unproject_ndc_to_latlon(proj, &cam, cursor_ndc.0, cursor_ndc.1, aspect).unwrap();
+        assert!(
+            haversine_km(lat_before, lon_before, lat_after, lon_after) < 10.0,
+            "{:?} cursor-centered zoom drifted from ({lat_before:.3},{lon_before:.3}) to ({lat_after:.3},{lon_after:.3})",
+            proj
+        );
+    }
+
+    for (proj, test_lat) in [
+        (MapProjectionKind::ArcticPolarStereo, 68.0),
+        (MapProjectionKind::AntarcticPolarStereo, -72.0),
+    ] {
+        let cam = CameraState {
+            center_lon: 15.0,
+            center_lat: 0.0,
+            zoom: 1.2,
+            pitch_deg: 0.0,
+            bearing_deg: -42.5,
+            vertical_exaggeration: 15.0,
+        };
+        let (nx, ny) = project_latlon_to_ndc(proj, &cam, test_lat, -110.0, 0.0, 1.6).unwrap();
+        let (rlat, rlon) = unproject_ndc_to_latlon(proj, &cam, nx as f64, ny as f64, 1.6).unwrap();
+        assert!(haversine_km(test_lat, -110.0, rlat, rlon) < 2.0);
+    }
 }

@@ -797,9 +797,14 @@ pub fn project_latlon_to_ndc(
             let phi = lat_deg.to_radians();
             let lam = (lon_deg - cam.center_lon).to_radians();
             let rho = (std::f64::consts::FRAC_PI_4 - 0.5 * phi).tan();
+            let raw_x = rho * lam.sin();
+            let raw_y = -rho * lam.cos();
+            let b = cam.bearing_deg.to_radians();
+            let rot_x = raw_x * b.cos() - raw_y * b.sin();
+            let rot_y = raw_x * b.sin() + raw_y * b.cos();
             let scale = 0.78 * cam.zoom;
-            let x = rho * lam.sin() * scale / aspect;
-            let y = -rho * lam.cos() * scale;
+            let x = rot_x * scale / aspect;
+            let y = rot_y * scale;
             Some((x as f32, y as f32))
         }
         MapProjectionKind::AntarcticPolarStereo => {
@@ -809,9 +814,14 @@ pub fn project_latlon_to_ndc(
             let phi = (-lat_deg).to_radians();
             let lam = (lon_deg - cam.center_lon).to_radians();
             let rho = (std::f64::consts::FRAC_PI_4 - 0.5 * phi).tan();
+            let raw_x = rho * lam.sin();
+            let raw_y = rho * lam.cos();
+            let b = cam.bearing_deg.to_radians();
+            let rot_x = raw_x * b.cos() - raw_y * b.sin();
+            let rot_y = raw_x * b.sin() + raw_y * b.cos();
             let scale = 0.78 * cam.zoom;
-            let x = rho * lam.sin() * scale / aspect;
-            let y = rho * lam.cos() * scale;
+            let x = rot_x * scale / aspect;
+            let y = rot_y * scale;
             Some((x as f32, y as f32))
         }
     }
@@ -872,8 +882,11 @@ pub fn unproject_ndc_to_latlon(
         }
         MapProjectionKind::ArcticPolarStereo => {
             let scale = 0.78 * cam.zoom;
-            let x = (ndc_x * aspect) / scale;
-            let y = -ndc_y / scale;
+            let rx = (ndc_x * aspect) / scale;
+            let ry = ndc_y / scale;
+            let b = -cam.bearing_deg.to_radians();
+            let x = rx * b.cos() - ry * b.sin();
+            let y = -(rx * b.sin() + ry * b.cos());
             let rho = (x * x + y * y).sqrt();
             if rho > 1.35 {
                 return None;
@@ -885,8 +898,11 @@ pub fn unproject_ndc_to_latlon(
         }
         MapProjectionKind::AntarcticPolarStereo => {
             let scale = 0.78 * cam.zoom;
-            let x = (ndc_x * aspect) / scale;
-            let y = ndc_y / scale;
+            let rx = (ndc_x * aspect) / scale;
+            let ry = ndc_y / scale;
+            let b = -cam.bearing_deg.to_radians();
+            let x = rx * b.cos() - ry * b.sin();
+            let y = rx * b.sin() + ry * b.cos();
             let rho = (x * x + y * y).sqrt();
             if rho > 1.35 {
                 return None;
@@ -895,6 +911,77 @@ pub fn unproject_ndc_to_latlon(
             let lam = cam.center_lon.to_radians() + x.atan2(y);
             let lon = ((lam.to_degrees() + 540.0).rem_euclid(360.0)) - 180.0;
             Some((phi.to_degrees().clamp(-90.0, 90.0), lon))
+        }
+    }
+}
+
+/// Adjust `cam.zoom` by `factor` (clamped to `[0.55, 8.5]`) while anchoring the geographic
+/// coordinate under `cursor_ndc = (ndc_x, ndc_y)` fixed in viewport space where feasible.
+pub fn zoom_camera_toward_ndc(
+    proj: MapProjectionKind,
+    cam: &mut CameraState,
+    factor: f64,
+    cursor_ndc: Option<(f64, f64)>,
+    aspect_w_over_h: f64,
+) {
+    if !factor.is_finite() || factor <= 0.0 {
+        return;
+    }
+    let old_zoom = cam.zoom;
+    let new_zoom = (old_zoom * factor).clamp(0.55, 8.5);
+    if (new_zoom - old_zoom).abs() < 1.0e-12 {
+        return;
+    }
+
+    let Some((ndc_x, ndc_y)) = cursor_ndc else {
+        cam.zoom = new_zoom;
+        return;
+    };
+    let aspect = aspect_w_over_h.max(0.2);
+    let Some((target_lat, target_lon)) = unproject_ndc_to_latlon(proj, cam, ndc_x, ndc_y, aspect)
+    else {
+        cam.zoom = new_zoom;
+        return;
+    };
+
+    cam.zoom = new_zoom;
+    match proj {
+        MapProjectionKind::Equirectangular2d => {
+            let (scale_x, scale_y) = equirectangular_scales(aspect);
+            let dlon = (ndc_x / (new_zoom * scale_x)) * 180.0;
+            let dlat = (ndc_y / (new_zoom * scale_y)) * 90.0;
+            cam.center_lon = ((target_lon - dlon + 540.0).rem_euclid(360.0)) - 180.0;
+            cam.center_lat = (target_lat - dlat).clamp(-88.0, 88.0);
+        }
+        MapProjectionKind::Globe3dWgs84 => {
+            let radius = 0.86 * new_zoom;
+            let sx = (ndc_x * aspect) / radius;
+            let sy = ndc_y / radius;
+            if sx * sx + sy * sy <= 0.985 {
+                let b = cam.bearing_deg.to_radians();
+                for _ in 0..5 {
+                    let Some((nx_p, ny_p)) =
+                        project_latlon_to_ndc(proj, cam, target_lat, target_lon, 0.0, aspect)
+                    else {
+                        break;
+                    };
+                    let err_x = (ndc_x - nx_p as f64) * aspect;
+                    let err_y = ndc_y - ny_p as f64;
+                    if err_x.hypot(err_y) < 1.0e-4 {
+                        break;
+                    }
+                    let raw_dx = err_x * b.cos() + err_y * b.sin();
+                    let raw_dy = -err_x * b.sin() + err_y * b.cos();
+                    let cos_lat = cam.center_lat.to_radians().cos().max(0.2);
+                    let dlat = -(raw_dy / radius).to_degrees();
+                    let dlon = -(raw_dx / (radius * cos_lat)).to_degrees();
+                    cam.center_lat = (cam.center_lat + dlat).clamp(-88.0, 88.0);
+                    cam.center_lon = ((cam.center_lon + dlon + 540.0).rem_euclid(360.0)) - 180.0;
+                }
+            }
+        }
+        MapProjectionKind::ArcticPolarStereo | MapProjectionKind::AntarcticPolarStereo => {
+            // Polar stereographic center is pinned at the geographic pole; zooming scales radially.
         }
     }
 }
