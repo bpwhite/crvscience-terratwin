@@ -4,6 +4,9 @@ version = "2.5.0"
 edition = "2021"
 description = "TerraTwin HPC Climate Modeling & Telemetry Hub — Rust native headless daemon + desktop global map GUI with SQLite data management and multi-threaded Rayon climate physics simulation"
 license = "GPL-3.0-or-later"
+homepage = "https://crvscience.com/apps"
+repository = "https://github.com/bpwhite/crvscience-terratwin"
+readme = "README.md"
 
 [features]
 default = ["gui"]
