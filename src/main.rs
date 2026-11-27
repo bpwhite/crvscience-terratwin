@@ -19,6 +19,7 @@
 //!    `terratwin step`, `terratwin status`, `terratwin export`, `terratwin prune`)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,7 +27,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use terratwin_climate_hub::{
     db::{ClimateDatabase, RetentionPolicy, ZarrCompressionCodec},
-    physics::SimulationConfig,
+    physics::{compare_ssp_pathways, SimulationConfig},
     schema::{HubSchema, SspScenario},
     worker::{run_single_headless_cycle, BackgroundCoordinator},
 };
@@ -158,9 +159,23 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         vacuum: bool,
     },
+
+    /// Compare SSP1-2.6 vs SSP2-4.5 vs SSP5-8.5 temperature, sea-level rise, and carbon anomalies
+    CompareSsp {
+        /// Target simulation year (1950.0 .. 2100.0)
+        #[arg(long, default_value_t = 2100.0)]
+        year: f64,
+        /// Output format (`table`, `json`, or `csv`)
+        #[arg(long, default_value = "table")]
+        format: String,
+        /// Optional output file path (writes stdout when omitted)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn attach_parent_console_if_cli() {
     if std::env::args_os().len() > 1 {
         unsafe {
@@ -329,6 +344,35 @@ fn main() -> Result<()> {
             });
             let report = db.prune_expired_history(vacuum)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+
+        Some(Commands::CompareSsp {
+            year,
+            format,
+            output,
+        }) => {
+            let report = compare_ssp_pathways(year);
+            let rendered = match format.trim().to_ascii_lowercase().as_str() {
+                "json" => report.to_json_pretty()?,
+                "csv" => report.to_csv(),
+                _ => report.format_table(),
+            };
+            if let Some(ref out_path) = output {
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                }
+                std::fs::write(out_path, &rendered)?;
+                info!(
+                    "Wrote SSP pathway delta comparison ({}) to {}",
+                    format,
+                    out_path.display()
+                );
+            } else {
+                println!("{rendered}");
+            }
             Ok(())
         }
 

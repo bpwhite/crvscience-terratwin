@@ -4839,3 +4839,204 @@ fn compute_land_cryosphere_profile_impl(
         levels,
     }
 }
+
+/// Cross-pathway climate anomaly metrics for a single IPCC SSP trajectory at a target year.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SspPathwayDeltaRow {
+    pub scenario: String,
+    pub year: f64,
+    pub co2_ppm: f64,
+    pub delta_co2_vs_ssp126_ppm: f64,
+    pub delta_co2_vs_ssp245_ppm: f64,
+    pub radiative_forcing_wm2: f64,
+    pub transient_temp_anomaly_c: f64,
+    pub equilibrium_temp_anomaly_c: f64,
+    pub delta_temp_vs_ssp126_c: f64,
+    pub delta_temp_vs_ssp245_c: f64,
+    pub arctic_temp_anomaly_c: f64,
+    pub thermosteric_slr_cm: f64,
+    pub delta_slr_vs_ssp126_cm: f64,
+    pub delta_slr_vs_ssp245_cm: f64,
+    pub surface_ocean_ph: f64,
+    pub omega_aragonite: f64,
+}
+
+/// Multi-pathway SSP delta comparison report (`SSP1-2.6` vs `SSP2-4.5` vs `SSP5-8.5`) at a given year.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SspPathwayDeltaReport {
+    pub year: f64,
+    pub reference_low: String,
+    pub reference_mid: String,
+    pub rows: Vec<SspPathwayDeltaRow>,
+}
+
+/// Compare `SSP1-2.6`, `SSP2-4.5`, and `SSP5-8.5` temperature, thermosteric sea-level rise,
+/// atmospheric carbon, and surface ocean carbonate anomalies at `year` (clamped to `1950.0..=2100.0`).
+pub fn compare_ssp_pathways(year: f64) -> SspPathwayDeltaReport {
+    let clamped_year = if year.is_finite() {
+        year.clamp(1950.0, 2100.0)
+    } else {
+        2100.0
+    };
+    let scenarios = [
+        SspScenario::Ssp1_26,
+        SspScenario::Ssp2_45,
+        SspScenario::Ssp5_85,
+    ];
+
+    let metrics = |ssp: SspScenario| -> (f64, f64, f64, f64, f64, f64, f64, f64) {
+        let co2 = ssp.co2_ppm_at_year(clamped_year);
+        let erf = co2_radiative_forcing_wm2(co2);
+        let dt_trans = transient_global_warming_c(co2);
+        let dt_eq = equilibrium_global_warming_c(co2);
+        let dt_arctic = regional_cmip6_delta_t_c(ssp, clamped_year, ClimateRegion::Arctic, 75.0);
+        let slr_cm = (dt_trans - 0.9).max(0.0) * 28.5;
+        let carb = solve_seawater_carbonate_chemistry(19.0, 35.0, co2, 0.0);
+        (
+            co2,
+            erf,
+            dt_trans,
+            dt_eq,
+            dt_arctic,
+            slr_cm,
+            carb.ph_total,
+            carb.omega_aragonite,
+        )
+    };
+
+    let (co2_126, _, dt_126, _, _, slr_126, _, _) = metrics(SspScenario::Ssp1_26);
+    let (co2_245, _, dt_245, _, _, slr_245, _, _) = metrics(SspScenario::Ssp2_45);
+
+    let rows = scenarios
+        .into_iter()
+        .map(|ssp| {
+            let (co2, erf, dt_trans, dt_eq, dt_arctic, slr_cm, ph, omega) = metrics(ssp);
+            SspPathwayDeltaRow {
+                scenario: ssp.code().to_string(),
+                year: clamped_year,
+                co2_ppm: co2,
+                delta_co2_vs_ssp126_ppm: co2 - co2_126,
+                delta_co2_vs_ssp245_ppm: co2 - co2_245,
+                radiative_forcing_wm2: erf,
+                transient_temp_anomaly_c: dt_trans,
+                equilibrium_temp_anomaly_c: dt_eq,
+                delta_temp_vs_ssp126_c: dt_trans - dt_126,
+                delta_temp_vs_ssp245_c: dt_trans - dt_245,
+                arctic_temp_anomaly_c: dt_arctic,
+                thermosteric_slr_cm: slr_cm,
+                delta_slr_vs_ssp126_cm: slr_cm - slr_126,
+                delta_slr_vs_ssp245_cm: slr_cm - slr_245,
+                surface_ocean_ph: ph,
+                omega_aragonite: omega,
+            }
+        })
+        .collect();
+
+    SspPathwayDeltaReport {
+        year: clamped_year,
+        reference_low: SspScenario::Ssp1_26.code().to_string(),
+        reference_mid: SspScenario::Ssp2_45.code().to_string(),
+        rows,
+    }
+}
+
+impl SspPathwayDeltaReport {
+    pub fn to_json_pretty(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    pub fn to_csv(&self) -> String {
+        let mut out = String::from(
+            "scenario,year,co2_ppm,delta_co2_vs_ssp126_ppm,delta_co2_vs_ssp245_ppm,radiative_forcing_wm2,transient_temp_anomaly_c,equilibrium_temp_anomaly_c,delta_temp_vs_ssp126_c,delta_temp_vs_ssp245_c,arctic_temp_anomaly_c,thermosteric_slr_cm,delta_slr_vs_ssp126_cm,delta_slr_vs_ssp245_cm,surface_ocean_ph,omega_aragonite\n",
+        );
+        for r in &self.rows {
+            out.push_str(&format!(
+                "{},{:.2},{:.2},{:+.2},{:+.2},{:.3},{:.3},{:.3},{:+.3},{:+.3},{:.3},{:.3},{:+.3},{:+.3},{:.4},{:.3}\n",
+                r.scenario,
+                r.year,
+                r.co2_ppm,
+                r.delta_co2_vs_ssp126_ppm,
+                r.delta_co2_vs_ssp245_ppm,
+                r.radiative_forcing_wm2,
+                r.transient_temp_anomaly_c,
+                r.equilibrium_temp_anomaly_c,
+                r.delta_temp_vs_ssp126_c,
+                r.delta_temp_vs_ssp245_c,
+                r.arctic_temp_anomaly_c,
+                r.thermosteric_slr_cm,
+                r.delta_slr_vs_ssp126_cm,
+                r.delta_slr_vs_ssp245_cm,
+                r.surface_ocean_ph,
+                r.omega_aragonite,
+            ));
+        }
+        out
+    }
+
+    pub fn format_table(&self) -> String {
+        let mut out = format!(
+            "=== TerraTwin SSP Pathway Delta Comparator (Year {:.1}) ===\n",
+            self.year
+        );
+        out.push_str(&format!(
+            "{:<9} {:>8} {:>9} {:>7} {:>9} {:>8} {:>9} {:>9} {:>6}\n",
+            "Scenario", "CO2(ppm)", "dCO2_126", "dT(C)", "dT_126", "SLR(cm)", "dSLR_126", "Arctic dT", "pH"
+        ));
+        for r in &self.rows {
+            out.push_str(&format!(
+                "{:<9} {:>8.1} {:>+9.1} {:>+7.2} {:>+9.2} {:>8.1} {:>+9.1} {:>+9.2} {:>6.3}\n",
+                r.scenario,
+                r.co2_ppm,
+                r.delta_co2_vs_ssp126_ppm,
+                r.transient_temp_anomaly_c,
+                r.delta_temp_vs_ssp126_c,
+                r.thermosteric_slr_cm,
+                r.delta_slr_vs_ssp126_cm,
+                r.arctic_temp_anomaly_c,
+                r.surface_ocean_ph,
+            ));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssp_pathway_delta_comparator_orders_monotonically_and_exports_json_csv() {
+        let report = compare_ssp_pathways(2100.0);
+        assert_eq!(report.rows.len(), 3);
+        assert_eq!(report.rows[0].scenario, "SSP1-2.6");
+        assert_eq!(report.rows[1].scenario, "SSP2-4.5");
+        assert_eq!(report.rows[2].scenario, "SSP5-8.5");
+
+        assert!(report.rows[0].delta_temp_vs_ssp126_c.abs() < 1e-12);
+        assert!(report.rows[1].delta_temp_vs_ssp245_c.abs() < 1e-12);
+        assert!(report.rows[2].co2_ppm > report.rows[1].co2_ppm);
+        assert!(report.rows[1].co2_ppm > report.rows[0].co2_ppm);
+        assert!(report.rows[2].transient_temp_anomaly_c > report.rows[1].transient_temp_anomaly_c);
+        assert!(report.rows[2].thermosteric_slr_cm > report.rows[1].thermosteric_slr_cm);
+        assert!(report.rows[2].surface_ocean_ph < report.rows[0].surface_ocean_ph);
+
+        let csv = report.to_csv();
+        assert!(csv.starts_with("scenario,year,co2_ppm,"));
+        assert_eq!(csv.lines().count(), 4);
+        assert!(csv.contains("SSP5-8.5"));
+
+        let json_str = report.to_json_pretty().expect("serialize SSP delta report");
+        let parsed: SspPathwayDeltaReport =
+            serde_json::from_str(&json_str).expect("deserialize SSP delta report");
+        assert_eq!(parsed.rows.len(), 3);
+        assert!((parsed.rows[2].delta_slr_vs_ssp126_cm - report.rows[2].delta_slr_vs_ssp126_cm).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ssp_pathway_delta_comparator_clamps_invalid_year() {
+        let nan_rep = compare_ssp_pathways(f64::NAN);
+        assert!((nan_rep.year - 2100.0).abs() < 1e-9);
+        let past_rep = compare_ssp_pathways(1900.0);
+        assert!((past_rep.year - 1950.0).abs() < 1e-9);
+    }
+}

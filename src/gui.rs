@@ -40,10 +40,10 @@ use crate::interp::{
     PressureExtrema,
 };
 use crate::physics::{
-    compute_land_cryosphere_profile_from_grids_at_doy, compute_ocean_ctd_profile_from_grids,
-    compute_vertical_sounding_from_grids, elevation_slope_m_per_deg, regional_cmip6_delta_t_c,
-    snapshot_regional_delta_t_c, synthetic_planetary_elevation_m, ClimateRegion,
-    LandCryosphereProfile, SimulationConfig,
+    compare_ssp_pathways, compute_land_cryosphere_profile_from_grids_at_doy,
+    compute_ocean_ctd_profile_from_grids, compute_vertical_sounding_from_grids,
+    elevation_slope_m_per_deg, regional_cmip6_delta_t_c, snapshot_regional_delta_t_c,
+    synthetic_planetary_elevation_m, ClimateRegion, LandCryosphereProfile, SimulationConfig,
 };
 use crate::schema::{HubSchema, SspScenario};
 use crate::worker::{RunningWorkers, TelemetrySnapshot};
@@ -149,6 +149,10 @@ pub struct TerraTwinGuiApp {
     left_sidebar_open: bool,
     right_drawer_open: bool,
     about_open: bool,
+    command_palette_open: bool,
+    command_palette_just_opened: bool,
+    command_palette_query: String,
+    ssp_compare_year: f64,
     crosshair_inspector: bool,
     transect_mode: bool,
     transect_points: Vec<(f64, f64)>,
@@ -244,6 +248,10 @@ impl TerraTwinGuiApp {
             left_sidebar_open: true,
             right_drawer_open: true,
             about_open: false,
+            command_palette_open: false,
+            command_palette_just_opened: false,
+            command_palette_query: String::new(),
+            ssp_compare_year: 2100.0,
             crosshair_inspector: true,
             transect_mode: false,
             transect_points: Vec::new(),
@@ -914,8 +922,464 @@ impl TerraTwinGuiApp {
                     {
                         self.about_open = !self.about_open;
                     }
+                    if ui
+                        .selectable_label(self.command_palette_open, "Palette (Ctrl+K)")
+                        .on_hover_text("Fuzzy quick-jump command palette for SSP pathways, layers, tipping points, and exports (Ctrl+K)")
+                        .clicked()
+                    {
+                        self.command_palette_open = !self.command_palette_open;
+                        self.command_palette_just_opened = self.command_palette_open;
+                    }
                 });
             });
+    }
+
+    fn export_ssp_delta_file(&mut self, as_csv: bool) {
+        let report = compare_ssp_pathways(self.ssp_compare_year);
+        let ext = if as_csv { "csv" } else { "json" };
+        let filter_name = if as_csv { "CSV Table" } else { "JSON Report" };
+        if let Some(out_file) = rfd::FileDialog::new()
+            .set_title("Export SSP Pathway Delta Comparison")
+            .add_filter(filter_name, &[ext])
+            .set_file_name(format!("terratwin_ssp_delta_{:.0}.{ext}", report.year))
+            .save_file()
+        {
+            let content = if as_csv {
+                Ok(report.to_csv())
+            } else {
+                report.to_json_pretty()
+            };
+            match content.and_then(|body| Ok(std::fs::write(&out_file, body)?)) {
+                Ok(()) => {
+                    self.export_status_msg = format!(
+                        "SSP delta {} ({:.0}) -> {}",
+                        ext.to_ascii_uppercase(),
+                        report.year,
+                        out_file.display()
+                    );
+                }
+                Err(e) => {
+                    self.export_status_msg = format!("SSP delta export failed: {e}");
+                }
+            }
+        }
+    }
+
+    fn apply_palette_command(&mut self, cmd: &PaletteAction) {
+        let schema = self.workers.coordinator.schema().clone();
+        match cmd {
+            PaletteAction::SetSsp(ssp, year_opt) => {
+                self.sim_cfg.scenario = *ssp;
+                if let Some(yr) = year_opt {
+                    self.sim_cfg.sim_year = *yr;
+                    self.temporal_mode_id = "cmip_projections".to_string();
+                    self.ssp_compare_year = *yr;
+                }
+                self.push_sim_update();
+            }
+            PaletteAction::ApplyPreset(preset) => {
+                self.apply_quick_preset(*preset);
+            }
+            PaletteAction::FocusTippingPoint {
+                lat,
+                lon,
+                zoom,
+                layer_ids,
+                region,
+            } => {
+                self.pinned_coord = (*lat, *lon);
+                self.camera.center_lat = *lat;
+                self.camera.center_lon = *lon;
+                self.camera.zoom = *zoom;
+                self.coord_search_buf = format!("{:.4}, {:.4}", lat, lon);
+                self.cmip6_region = *region;
+                for st in self.layer_states.values_mut() {
+                    st.visible = false;
+                }
+                for id in *layer_ids {
+                    if let Some(st) = self.layer_states.get_mut(*id) {
+                        st.visible = true;
+                    }
+                }
+                self.right_drawer_open = true;
+                self.raster_dirty = true;
+            }
+            PaletteAction::FocusLayer(layer_id) => {
+                self.solo_restore_vis = None;
+                for (_, lyr) in schema.all_layers() {
+                    if let Some(st) = self.layer_states.get_mut(&lyr.id) {
+                        st.visible = lyr.id == *layer_id;
+                    }
+                }
+                self.raster_dirty = true;
+            }
+            PaletteAction::SetProjection(proj) => {
+                self.projection = *proj;
+                self.raster_dirty = true;
+            }
+            PaletteAction::ToggleLeftDrawer => {
+                self.left_sidebar_open = !self.left_sidebar_open;
+            }
+            PaletteAction::ToggleRightDrawer => {
+                self.right_drawer_open = !self.right_drawer_open;
+            }
+            PaletteAction::ResetCamera => {
+                self.reset_camera();
+            }
+            PaletteAction::ExportSspDeltaCsv => {
+                self.export_ssp_delta_file(true);
+            }
+            PaletteAction::ExportSspDeltaJson => {
+                self.export_ssp_delta_file(false);
+            }
+            PaletteAction::ExportVisibleZarr => {
+                let (plat, plon) = self.pinned_coord;
+                let first_vis = schema
+                    .all_layers()
+                    .into_iter()
+                    .find(|(_, l)| {
+                        self.layer_states
+                            .get(&l.id)
+                            .map(|s| s.visible)
+                            .unwrap_or(false)
+                    })
+                    .map(|(g, l)| {
+                        let lvl = if g.group_id == "physical_biogeochemical_oceanography" {
+                            self.sim_cfg.ocean_depth_m
+                        } else {
+                            self.sim_cfg.atmospheric_level_hpa
+                        };
+                        (l.id.clone(), lvl)
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            "cmip6_downscaled_ensemble".to_string(),
+                            self.sim_cfg.atmospheric_level_hpa,
+                        )
+                    });
+                if let Some(out_dir) = rfd::FileDialog::new()
+                    .set_title("Export Zarr v3 Climate Subset Store")
+                    .set_file_name(format!("subset_{}.zarr", first_vis.0))
+                    .save_file()
+                {
+                    match self.workers.coordinator.db().export_zarr_v3_store(
+                        &first_vis.0,
+                        self.sim_cfg.scenario,
+                        first_vis.1,
+                        (plat - 20.0).max(-90.0),
+                        (plat + 20.0).min(90.0),
+                        (plon - 25.0).max(-180.0),
+                        (plon + 25.0).min(180.0),
+                        (18, 36),
+                        &out_dir,
+                    ) {
+                        Ok(sum) => {
+                            self.export_status_msg = format!(
+                                "Zarr v3 ({} chunks, {} cells) -> {}",
+                                sum.chunks_written, sum.cells_exported, sum.store_dir
+                            );
+                        }
+                        Err(e) => {
+                            self.export_status_msg = format!("Zarr v3 export failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn build_palette_entries(&self) -> Vec<PaletteEntry> {
+        let mut entries = vec![
+            PaletteEntry {
+                category: "SSP",
+                title: "SSP1-1.9 Net-Zero Sustainability (2100)".into(),
+                subtitle: "Low radiative forcing ~1.9 W/m2 with CO2 drawdown to ~393 ppm".into(),
+                action: PaletteAction::SetSsp(SspScenario::Ssp1_19, Some(2100.0)),
+            },
+            PaletteEntry {
+                category: "SSP",
+                title: "SSP1-2.6 Paris-Aligned Low Emissions (2100)".into(),
+                subtitle: "Compare baseline low-emissions pathway (~446 ppm CO2)".into(),
+                action: PaletteAction::SetSsp(SspScenario::Ssp1_26, Some(2100.0)),
+            },
+            PaletteEntry {
+                category: "SSP",
+                title: "SSP2-4.5 Intermediate Pathway (2050)".into(),
+                subtitle: "Middle-of-the-road mid-century forcing & warming".into(),
+                action: PaletteAction::ApplyPreset(QuickScenarioPreset::ModerateSsp245),
+            },
+            PaletteEntry {
+                category: "SSP",
+                title: "SSP3-7.0 Regional Rivalry High Forcing (2100)".into(),
+                subtitle: "High emissions trajectory reaching ~867 ppm CO2 by 2100".into(),
+                action: PaletteAction::SetSsp(SspScenario::Ssp3_70, Some(2100.0)),
+            },
+            PaletteEntry {
+                category: "SSP",
+                title: "SSP5-8.5 Fossil-Fueled High Emissions (2100)".into(),
+                subtitle: "Extreme heat stress, SLR, and Arctic sea-ice loss (~1135 ppm)".into(),
+                action: PaletteAction::ApplyPreset(QuickScenarioPreset::HighEmissionsSsp585),
+            },
+            PaletteEntry {
+                category: "SSP",
+                title: "Baseline Present-Day Telemetry (Now)".into(),
+                subtitle: "Reset simulation year to current UTC and restore default layers".into(),
+                action: PaletteAction::ApplyPreset(QuickScenarioPreset::BaselinePresent),
+            },
+            PaletteEntry {
+                category: "Tipping",
+                title: "Arctic Permafrost & Sea-Ice Loss (72°N, 125°E)".into(),
+                subtitle: "Focus Siberian Arctic permafrost thaw, sea-ice drift, and polar amplification".into(),
+                action: PaletteAction::FocusTippingPoint {
+                    lat: 72.0,
+                    lon: 125.0,
+                    zoom: 2.2,
+                    layer_ids: &[
+                        "permafrost_thermokarst_subsidence",
+                        "sea_ice_concentration_drift",
+                        "cmip6_downscaled_ensemble",
+                    ],
+                    region: ClimateRegion::Arctic,
+                },
+            },
+            PaletteEntry {
+                category: "Tipping",
+                title: "Greenland Ice Sheet Mass Balance (72°N, -40°W)".into(),
+                subtitle: "Focus GRACE gravimetric ice loss and Arctic polar projection".into(),
+                action: PaletteAction::FocusTippingPoint {
+                    lat: 72.0,
+                    lon: -40.0,
+                    zoom: 2.4,
+                    layer_ids: &[
+                        "gravimetric_ice_sheet_mass_balance",
+                        "cmip6_downscaled_ensemble",
+                    ],
+                    region: ClimateRegion::Arctic,
+                },
+            },
+            PaletteEntry {
+                category: "Tipping",
+                title: "West Antarctic Ice Sheet & Amundsen Sea (75°S, -110°W)".into(),
+                subtitle: "Focus Antarctic basal melt, ice mass balance, and coastal SLR".into(),
+                action: PaletteAction::FocusTippingPoint {
+                    lat: -75.0,
+                    lon: -110.0,
+                    zoom: 2.3,
+                    layer_ids: &[
+                        "gravimetric_ice_sheet_mass_balance",
+                        "sea_ice_concentration_drift",
+                        "coastal_inundation_storm_surge",
+                    ],
+                    region: ClimateRegion::Antarctic,
+                },
+            },
+            PaletteEntry {
+                category: "Tipping",
+                title: "AMOC Subpolar North Atlantic Gyre (56°N, -35°W)".into(),
+                subtitle: "Focus thermohaline circulation slowdown and subsurface heat/salinity".into(),
+                action: PaletteAction::FocusTippingPoint {
+                    lat: 56.0,
+                    lon: -35.0,
+                    zoom: 2.1,
+                    layer_ids: &[
+                        "thermohaline_currents_amoc",
+                        "subsurface_ocean_heat_salinity_3d",
+                        "sst_marine_heatwaves",
+                    ],
+                    region: ClimateRegion::MidLatitudes,
+                },
+            },
+            PaletteEntry {
+                category: "Tipping",
+                title: "Amazon Basin Canopy & Evaporative Stress (4°S, -63°W)".into(),
+                subtitle: "Focus rainforest SIF photosynthesis, biomass, and fire weather".into(),
+                action: PaletteAction::FocusTippingPoint {
+                    lat: -4.0,
+                    lon: -63.0,
+                    zoom: 2.2,
+                    layer_ids: &[
+                        "sif_photosynthesis_evaporative_stress",
+                        "canopy_height_aboveground_biomass",
+                        "compound_hazard_fire_weather_index",
+                    ],
+                    region: ClimateRegion::Tropics,
+                },
+            },
+            PaletteEntry {
+                category: "Tipping",
+                title: "Tropical Coral Reefs & Ocean Acidification (0°N, -145°W)".into(),
+                subtitle: "Focus Niño 3.4 SST marine heatwaves and aragonite saturation state".into(),
+                action: PaletteAction::FocusTippingPoint {
+                    lat: 0.0,
+                    lon: -145.0,
+                    zoom: 1.9,
+                    layer_ids: &[
+                        "ocean_acidification_carbonate",
+                        "sst_marine_heatwaves",
+                        "teleconnection_oscillation_masks",
+                    ],
+                    region: ClimateRegion::Tropics,
+                },
+            },
+            PaletteEntry {
+                category: "Export",
+                title: "Export SSP Delta Comparator CSV (SSP1-2.6 / 2-4.5 / 5-8.5)".into(),
+                subtitle: format!("Save cross-pathway temperature, SLR, and CO2 table at year {:.0}", self.ssp_compare_year),
+                action: PaletteAction::ExportSspDeltaCsv,
+            },
+            PaletteEntry {
+                category: "Export",
+                title: "Export SSP Delta Comparator JSON (SSP1-2.6 / 2-4.5 / 5-8.5)".into(),
+                subtitle: format!("Save structured SSP delta JSON report at year {:.0}", self.ssp_compare_year),
+                action: PaletteAction::ExportSspDeltaJson,
+            },
+            PaletteEntry {
+                category: "Export",
+                title: "Export Active Layer Zarr v3 Subset Store...".into(),
+                subtitle: "Write Zarr v3 compressed directory store around pinned coordinate".into(),
+                action: PaletteAction::ExportVisibleZarr,
+            },
+            PaletteEntry {
+                category: "View",
+                title: "Projection: 3D Globe (EPSG:4978)".into(),
+                subtitle: "Switch viewport to shaded 3D orthographic globe".into(),
+                action: PaletteAction::SetProjection(MapProjectionKind::Globe3dWgs84),
+            },
+            PaletteEntry {
+                category: "View",
+                title: "Projection: 2D Equirectangular (EPSG:4326)".into(),
+                subtitle: "Switch viewport to full-Earth geographic grid".into(),
+                action: PaletteAction::SetProjection(MapProjectionKind::Equirectangular2d),
+            },
+            PaletteEntry {
+                category: "View",
+                title: "Projection: Arctic Polar Stereographic (EPSG:3995)".into(),
+                subtitle: "Switch viewport to North Polar projection".into(),
+                action: PaletteAction::SetProjection(MapProjectionKind::ArcticPolarStereo),
+            },
+            PaletteEntry {
+                category: "View",
+                title: "Projection: Antarctic Polar Stereographic (EPSG:3031)".into(),
+                subtitle: "Switch viewport to South Polar projection".into(),
+                action: PaletteAction::SetProjection(MapProjectionKind::AntarcticPolarStereo),
+            },
+            PaletteEntry {
+                category: "View",
+                title: "Toggle Left Predictive Layer Tree".into(),
+                subtitle: "Show or collapse the 34-layer sidebar (L)".into(),
+                action: PaletteAction::ToggleLeftDrawer,
+            },
+            PaletteEntry {
+                category: "View",
+                title: "Toggle Right Analytics & SSP Comparator Drawer".into(),
+                subtitle: "Show or collapse telemetry soundings, CMIP6, and SSP delta table (A)".into(),
+                action: PaletteAction::ToggleRightDrawer,
+            },
+            PaletteEntry {
+                category: "View",
+                title: "Reset Camera Center & Zoom".into(),
+                subtitle: "Restore default global camera view (R)".into(),
+                action: PaletteAction::ResetCamera,
+            },
+        ];
+
+        for (grp, lyr) in self.workers.coordinator.schema().all_layers() {
+            entries.push(PaletteEntry {
+                category: "Layer",
+                title: format!("Solo Layer: {}", lyr.name),
+                subtitle: format!("{} [{} | {}]", grp.group_name, lyr.id, lyr.units),
+                action: PaletteAction::FocusLayer(lyr.id.clone()),
+            });
+        }
+        entries
+    }
+
+    fn render_command_palette(&mut self, ctx: &egui::Context) {
+        if !self.command_palette_open {
+            return;
+        }
+        let mut keep_open = true;
+        let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let entries = self.build_palette_entries();
+        let q = self.command_palette_query.trim();
+        let mut scored: Vec<(i32, usize)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, e)| {
+                let hay = format!("{} {} {}", e.category, e.title, e.subtitle);
+                fuzzy_match_score(q, &hay).map(|s| (s, idx))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut activated: Option<PaletteAction> = None;
+        egui::Window::new("Quick-Jump Climate & SSP Palette (Ctrl+K)")
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 56.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Search:").strong());
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.command_palette_query)
+                            .id(egui::Id::new("terratwin_command_palette_input"))
+                            .hint_text("Type SSP pathway, climate layer, tipping point, or export...")
+                            .desired_width(430.0),
+                    );
+                    if self.command_palette_just_opened {
+                        resp.request_focus();
+                        self.command_palette_just_opened = false;
+                    }
+                    if ui.small_button("Clear").clicked() {
+                        self.command_palette_query.clear();
+                        resp.request_focus();
+                    }
+                });
+                ui.separator();
+
+                let first_match = scored.first().map(|&(_, idx)| entries[idx].action.clone());
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        if scored.is_empty() {
+                            ui.small("No matching SSP pathways, layers, tipping points, or exports.");
+                        } else {
+                            for &(_, idx) in scored.iter().take(16) {
+                                let entry = &entries[idx];
+                                let resp = ui
+                                    .selectable_label(
+                                        false,
+                                        format!("[{}] {}", entry.category, entry.title),
+                                    )
+                                    .on_hover_text(&entry.subtitle);
+                                ui.small(
+                                    egui::RichText::new(&entry.subtitle)
+                                        .color(Color32::from_rgb(148, 163, 184)),
+                                );
+                                ui.add_space(2.0);
+                                if resp.clicked() {
+                                    activated = Some(entry.action.clone());
+                                }
+                            }
+                        }
+                    });
+
+                if activated.is_none() && enter_pressed {
+                    activated = first_match;
+                }
+            });
+
+        if !keep_open {
+            self.command_palette_open = false;
+            self.command_palette_just_opened = false;
+        }
+        if let Some(action) = activated {
+            self.apply_palette_command(&action);
+            self.command_palette_open = false;
+            self.command_palette_just_opened = false;
+        }
     }
 
     fn render_about_window(&mut self, ctx: &egui::Context) {
@@ -1371,6 +1835,50 @@ impl TerraTwinGuiApp {
                         live_snapshot_val,
                     );
 
+                    ui.separator();
+                    ui.strong("SSP Pathway Delta Comparator (1-2.6 vs 2-4.5 vs 5-8.5)");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Year:");
+                        if ui.selectable_label((self.ssp_compare_year - 2050.0).abs() < 0.25, "2050").clicked() {
+                            self.ssp_compare_year = 2050.0;
+                        }
+                        if ui.selectable_label((self.ssp_compare_year - 2100.0).abs() < 0.25, "2100").clicked() {
+                            self.ssp_compare_year = 2100.0;
+                        }
+                        if ui.small_button("Sync Live").clicked() {
+                            self.ssp_compare_year = self.sim_cfg.sim_year.clamp(1950.0, 2100.0);
+                        }
+                    });
+                    let ssp_report = compare_ssp_pathways(self.ssp_compare_year);
+                    egui::Grid::new("terratwin_ssp_delta_grid")
+                        .striped(true)
+                        .spacing([8.0, 3.0])
+                        .show(ui, |ui| {
+                            ui.small(egui::RichText::new("SSP").strong());
+                            ui.small(egui::RichText::new("CO2").strong());
+                            ui.small(egui::RichText::new("ΔT").strong());
+                            ui.small(egui::RichText::new("SLR").strong());
+                            ui.small(egui::RichText::new("pH").strong());
+                            ui.end_row();
+                            for row in &ssp_report.rows {
+                                ui.small(egui::RichText::new(&row.scenario).monospace());
+                                ui.small(format!("{:.0} ({:+.0})", row.co2_ppm, row.delta_co2_vs_ssp126_ppm));
+                                ui.small(format!("{:+.2}° ({:+.2})", row.transient_temp_anomaly_c, row.delta_temp_vs_ssp126_c));
+                                ui.small(format!("{:.1}cm ({:+.1})", row.thermosteric_slr_cm, row.delta_slr_vs_ssp126_cm));
+                                ui.small(format!("{:.3}", row.surface_ocean_ph));
+                                ui.end_row();
+                            }
+                        });
+                    let mut export_ssp_fmt: Option<bool> = None;
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Export SSP JSON...").clicked() {
+                            export_ssp_fmt = Some(false);
+                        }
+                        if ui.small_button("Export SSP CSV...").clicked() {
+                            export_ssp_fmt = Some(true);
+                        }
+                    });
+
                     if self.transect_points.len() == 2 {
                         ui.separator();
                         let (a_la, a_lon) = self.transect_points[0];
@@ -1412,6 +1920,9 @@ impl TerraTwinGuiApp {
                                 self.sim_cfg.atmospheric_level_hpa,
                             )
                         });
+                    if let Some(as_csv) = export_ssp_fmt {
+                        self.export_ssp_delta_file(as_csv);
+                    }
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Export Zarr v3 Store...").clicked() {
                             if let Some(out_dir) = rfd::FileDialog::new()
@@ -2601,6 +3112,7 @@ impl TerraTwinGuiApp {
     pub fn ui_step(&mut self, ctx: &egui::Context) {
         let wants_kb = ctx.wants_keyboard_input();
         let (
+            toggle_palette,
             f1_pressed,
             esc_pressed,
             space_pressed,
@@ -2614,9 +3126,12 @@ impl TerraTwinGuiApp {
             left_pressed,
             right_pressed,
             has_cmd_mod,
-        ) = ctx.input(|i| {
+        ) = ctx.input_mut(|i| {
+            let cmd_k = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
+            let tk = i.consume_shortcut(&cmd_k);
             let cmd = i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command;
             (
+                tk,
                 i.key_pressed(egui::Key::F1),
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Space),
@@ -2632,11 +3147,18 @@ impl TerraTwinGuiApp {
                 cmd,
             )
         });
+        if toggle_palette {
+            self.command_palette_open = !self.command_palette_open;
+            self.command_palette_just_opened = self.command_palette_open;
+        }
         if f1_pressed {
             self.about_open = !self.about_open;
         }
         if esc_pressed {
-            if self.about_open {
+            if self.command_palette_open {
+                self.command_palette_open = false;
+                self.command_palette_just_opened = false;
+            } else if self.about_open {
                 self.about_open = false;
             } else if self.transect_mode || !self.transect_points.is_empty() {
                 self.transect_mode = false;
@@ -2751,6 +3273,7 @@ impl TerraTwinGuiApp {
         self.render_left_sidebar(ctx);
         self.render_right_analytics_drawer(ctx);
         self.render_central_map(ctx);
+        self.render_command_palette(ctx);
         self.render_about_window(ctx);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(45));
@@ -3615,18 +4138,68 @@ fn draw_viewport_colorbars(
     }
 }
 
+#[derive(Debug, Clone)]
+enum PaletteAction {
+    SetSsp(SspScenario, Option<f64>),
+    ApplyPreset(QuickScenarioPreset),
+    FocusTippingPoint {
+        lat: f64,
+        lon: f64,
+        zoom: f64,
+        layer_ids: &'static [&'static str],
+        region: ClimateRegion,
+    },
+    FocusLayer(String),
+    SetProjection(MapProjectionKind),
+    ToggleLeftDrawer,
+    ToggleRightDrawer,
+    ResetCamera,
+    ExportSspDeltaCsv,
+    ExportSspDeltaJson,
+    ExportVisibleZarr,
+}
+
+#[derive(Debug, Clone)]
+struct PaletteEntry {
+    category: &'static str,
+    title: String,
+    subtitle: String,
+    action: PaletteAction,
+}
+
+fn fuzzy_match_score(query: &str, text: &str) -> Option<i32> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let t = text.to_ascii_lowercase();
+    if let Some(pos) = t.find(&q) {
+        return Some(1000 - pos as i32);
+    }
+    let mut t_chars = t.char_indices();
+    let mut score = 200i32;
+    let mut prev_idx: Option<usize> = None;
+    for qc in q.chars() {
+        if qc.is_whitespace() {
+            continue;
+        }
+        let found = t_chars.find(|&(_, tc)| tc == qc);
+        match found {
+            Some((idx, _)) => {
+                if let Some(prev) = prev_idx {
+                    score -= (idx.saturating_sub(prev + 1)) as i32;
+                }
+                prev_idx = Some(idx);
+            }
+            None => return None,
+        }
+    }
+    Some(score)
+}
+
 fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
-    fn noop_clone(_: *const ()) -> std::task::RawWaker {
-        noop_raw_waker()
-    }
-    fn noop(_: *const ()) {}
-    fn noop_raw_waker() -> std::task::RawWaker {
-        static VTABLE: std::task::RawWakerVTable =
-            std::task::RawWakerVTable::new(noop_clone, noop, noop, noop);
-        std::task::RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    let waker = unsafe { std::task::Waker::from_raw(noop_raw_waker()) };
-    let mut cx = std::task::Context::from_waker(&waker);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
     let mut fut = std::pin::pin!(fut);
     loop {
         match fut.as_mut().poll(&mut cx) {
@@ -4245,6 +4818,85 @@ mod tests {
         let (_, anom_val, _) =
             sample_active_scalar_at(&schema, &snap, &app.layer_states, 10.0, -20.0, true).unwrap();
         assert!((anom_val - 0.5).abs() < 1e-4);
+
+        drop(app);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn command_palette_ctrl_k_fuzzy_match_and_tipping_point_jump() {
+        let db_path = std::env::temp_dir().join(format!(
+            "terratwin_gui_palette_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let schema = HubSchema::load(None).expect("embedded schema");
+        let db = ClimateDatabase::open(&db_path).expect("temp db");
+        let coord = BackgroundCoordinator::new(schema, db, SimulationConfig::default());
+        let workers = RunningWorkers::without_threads(coord);
+        let mut app = TerraTwinGuiApp::new_headless(workers);
+        let ctx = egui::Context::default();
+
+        assert!(fuzzy_match_score("permafrost", "Arctic Permafrost & Sea-Ice Loss").is_some());
+        assert!(fuzzy_match_score("apsl", "Arctic Permafrost & Sea-Ice Loss").is_some());
+        assert!(fuzzy_match_score("zzzz", "Arctic Permafrost & Sea-Ice Loss").is_none());
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |c| app.ui_step(c),
+        );
+        assert!(app.command_palette_open, "Ctrl+K must open command palette");
+
+        app.command_palette_query = "permafrost".to_string();
+        let entries = app.build_palette_entries();
+        let best = entries
+            .iter()
+            .filter_map(|e| {
+                let hay = format!("{} {} {}", e.category, e.title, e.subtitle);
+                fuzzy_match_score(&app.command_palette_query, &hay).map(|s| (s, e))
+            })
+            .max_by_key(|x| x.0)
+            .expect("matching tipping point entry")
+            .1
+            .clone();
+        app.apply_palette_command(&best.action);
+        assert!((app.pinned_coord.0 - 72.0).abs() < 1e-6);
+        assert!(app.layer_states["permafrost_thermokarst_subsidence"].visible);
+
+        // Escape dismisses palette
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |c| app.ui_step(c),
+        );
+        assert!(!app.command_palette_open, "Esc must close command palette");
 
         drop(app);
         let _ = std::fs::remove_file(&db_path);

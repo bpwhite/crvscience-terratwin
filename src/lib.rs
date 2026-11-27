@@ -18,6 +18,8 @@
 //! async public climate telemetry ingestion, spherical reprojection & 3D-Var Mass-Wind Balance PCG assimilation,
 //! multi-threaded Rayon climate physics simulation, and optional native `eframe`/`egui` GUI.
 
+#![forbid(unsafe_code)]
+
 pub mod coastlines;
 pub mod colormaps;
 pub mod db;
